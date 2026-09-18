@@ -3,8 +3,21 @@
 *.out
 coverage.txt
 
+# 构建产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# 只忽略根目录的构建产物：写成 `kvdb-bench` 会连带忽略 cmd/kvdb-bench/ 源码目录
+/kvdb-bench
+/kvdb-bench.exe
+
 # 本地数据目录与调试临时文件
 /data/
 /tmp/
 /_probe.txt
 /_*.log
+
+# WorkBuddy 的工作区数据（会话记录、memory 等），不进版本库
+/.workbuddy/
