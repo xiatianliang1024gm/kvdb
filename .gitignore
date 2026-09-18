@@ -1,0 +1,10 @@
+# 测试与覆盖率产物
+*.test
+*.out
+coverage.txt
+
+# 本地数据目录与调试临时文件
+/data/
+/tmp/
+/_probe.txt
+/_*.log
