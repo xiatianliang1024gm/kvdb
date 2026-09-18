@@ -2,7 +2,7 @@
 
 > 一个用 Go 实现的高性能嵌入式 KV 存储引擎，架构参考 RocksDB / LevelDB 的 LSM-Tree。
 >
-> 状态：M0（骨架）、M1（最小可用）、M2（读优化）、M3（写优化）均已完成 ｜ 最后更新：2026-09-18
+> 状态：M0（骨架）、M1（最小可用）、M2（读优化）、M3（写优化）、M4（一致性）均已完成 ｜ 最后更新：2026-09-18
 
 ## 目录
 
@@ -90,6 +90,13 @@ flowchart LR
 ```
 
 **写路径的关键在 WAL**：只要 fsync 成功就可以返回，MemTable 操作是纯内存的，所以写是 `O(log n)` 且没有随机 IO。这也意味着**写性能的天花板由 fsync 次数决定**，这是 Group Commit 存在的理由——把并发写请求合并成一次 fsync。
+
+> **M4 之后写路径的实际形态**：并发写者先排进一条写队列，队首那个写者（队长）把当前
+> 队列里的所有批次合并成**一次 WAL 追加 + 一次 fsync**，然后整组一起落进 MemTable。
+> 于是"写吞吐的天花板"从"每秒能做多少次 fsync"变成了"每秒能做多少次 fsync × 合并率"。
+> 队长只在两个极短的临界区里持 `db.mu`，最贵的 fsync 完全在锁外完成，所以
+> **读者不会被写者的磁盘等待堵住**。实测 32 个并发写者下合并率约 22～28（见 9.20），
+> 即同样次数 fsync 服务了二十多倍的写入。
 
 **读路径的代价在层数**：最坏情况下要穿透 MemTable、Immutable 和每一层。所以必须靠两个组件把无效查找挡在外面：
 
@@ -186,7 +193,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | **Block Cache** | 强烈建议 | 分片 LRU，缓存解压后的数据块 |
 | **WriteBatch** | 强烈建议 | 一次 WAL append 完成多条写，顺带拿到原子性 |
 | **Snapshot / MVCC** | 强烈建议 | 序列号 + 快照读。**建议一开始就在 key 里留 seq 字段**，后补代价极大 |
-| **Group Commit** | 建议 | 并发写合并成一次 fsync，高并发吞吐的关键 |
+| **Group Commit** | 建议 | 并发写合并成一次 fsync，高并发吞吐的关键（M4 已完成，见 9.18） |
 | **块压缩** | 建议 | Snappy / LZ4 / ZSTD，块级压缩 |
 | **Metrics / LOG** | 建议 | 命中率、各层文件数、读写放大倍数 |
 | **Rate Limiter** | 可选 | 限制 compaction 带宽，避免挤压前台请求 |
@@ -205,7 +212,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | **M1 最小可用** | WAL + MemTable（跳表） + 简单 SST + Get/Put/Delete + 崩溃恢复 | 单线程 10 万次读写结果正确；`kill -9` 后数据不丢 | 已完成 |
 | **M2 读优化** | Index Block + Bloom + Block Cache + Iterator | 点查不触发全文件扫描；范围扫描可用 | 已完成 |
 | **M3 写优化** | Flush + Leveled Compaction + Manifest/Version | L0 文件数收敛在阈值附近；读放大不随写入量增长 | 已完成 |
-| **M4 一致性** | Snapshot + WriteBatch + Group Commit | 并发压测下 race detector 无告警 | 未开始 |
+| **M4 一致性** | Snapshot + WriteBatch + Group Commit | 并发压测下 race detector 无告警 | 已完成 |
 | **M5 生产化** | 块压缩 + 限流 + Metrics + Checkpoint | 跑通 YCSB 并输出基准报告 | 未开始 |
 
 建议先把 M0 + M1 打通成一条完整链路，哪怕 SST 只有一个文件、查找用线性扫描——**能跑通"写入→崩溃→恢复→读回"这条闭环，比先把 SST 做得多漂亮重要得多。**
@@ -256,7 +263,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | M1 最小可用 | **已完成** | 2026-09-18 | 10 万次读写正确 + 子进程强杀后数据不丢，见 9.8 |
 | M2 读优化 | **已完成** | 2026-09-18 | 点查不再全文件扫描 + 范围扫描可用 + 读延迟的线性项被压掉约 3 个数量级，见 9.12 |
 | M3 写优化 | **已完成** | 2026-09-18 | L0 文件数被钉在触发阈值附近 + 读放大收敛为常数 + 崩溃/迁移路径均可恢复，见 9.16 |
-| M4 一致性 | 未开始 | — | — |
+| M4 一致性 | **已完成** | 2026-09-18 | 并发压测下 race detector 无告警 + 组提交把 1024 次写合并成 100 余次 fsync，见 9.20 |
 | M5 生产化 | 未开始 | — | — |
 
 ### 9.2 M0 交付物
@@ -919,8 +926,17 @@ MemTable，测的是真读路径）在 2000 → 20000 key 两端各测一次，�
 **④ 读视图在 Compaction 期间保持稳定** —— `TestSnapshotSurvivesCompaction`：
 在一次 Compaction 跨越两个快照之间时，两个快照各自读到的仍是它们该看到的版本；
 `TestIteratorSurvivesCompaction`：迭代器打开期间即使输入文件被 Compaction 合并掉，
-迭代仍能读完全部 key。这两条依赖版本引用计数（`Version.Ref/Unref`）与
-"打开迭代器时登记存活快照"，也是 `smallestSnapshot` 这个丢弃上界的唯一来源。
+迭代仍能读完全部 key。`smallestSnapshot` 这个丢弃上界的唯一来源是**登记在册的快照**。
+
+> 这里原本写成"迭代器也会登记存活快照"，与代码不符，M4 期间核实时订正：
+> 迭代器和快照是**两套不同的保护机制**，各自解决一半的问题（详见 9.21）——
+>
+>   - **快照**只记一个序列号，靠**登记**把自己写进 `db.snapshots`，作用是抬高
+>     `smallestSnapshot`，让 Compaction 保留它还要读的那些**旧版本**；
+>   - **迭代器**直接持有当时的**版本引用**（`Version.Ref`），靠引用计数让那批
+>     **输入文件**在读完之前删不掉。它读的永远是那批文件，而 Compaction 只会写新文件，
+>     所以**不需要**登记快照 —— 反过来说，如果给迭代器也登记快照，一个长命迭代器
+>     会把丢弃上界永久钉在它打开时的序列号上，白白拦住旧版本的回收。
 
 **⑤ 崩溃与迁移路径都能恢复，且不留残渣** ——
 `TestRecoveryClassifiesOrphanFiles` 区分两类孤儿：完整的进 `ObsoleteFiles`、
@@ -971,6 +987,188 @@ sst 76.2%、version 78.5%、wal 84.5%。
 | **`Commit` 三步的顺序：先开 reader → 再登记 → 最后提交版本** | 反过来会出现一个窗口："版本已经指向新文件、但读取器表里还没有它"，那一刻的读会报"没有登记的读取器"而不是拿到数据。所以 `commitCompaction` 把最贵的"打开输出文件"放在锁外做，进锁后先登记 reader 再落 Manifest。 |
 | **`Pick` 无事可做时返回 nil，而不是返回一个空 Compaction** | `runCompactions` 的循环因此有了干净的终止条件（`c == nil` 就退出本轮）。每轮都从**当前版本**重新挑一次，而不是一次挑完排队 —— 上一轮的结果会改变各层规模，也改变了下一轮该挑谁。 |
 | **`kvdb-bench` 的写放大分子不含"Compaction 读进来的字节"** | 写放大按 LSM 里通用的定义：`(WAL + Flush + Compaction 输出) / 用户放入的字节`。Compaction 的**输入**字节不计入分子 —— 那是读放大的一部分，混进写放大会让两个指标互相污染、都失去诊断价值。读放大单独按 `probes/get` 报。 |
+
+### 9.18 M4 交付物
+
+M4 的标题是"一致性"，但**这一阶段真正新写的东西只有一样：Group Commit**。
+
+三件交付物里，`WriteBatch` 在 M1 就已落地（`batch.go`：批次编码成一条 WAL 记录，
+原子性由"一条记录"保证），`Snapshot` 在 M2 就已落地（`db_iter.go` 的序列号视图 +
+M3 的 `db.snapshots` 登记表）。M4 对它们做的是三件事：补上语义边界、补上可观测性、
+用并发的用例把它们真正锁住 —— 因为"单线程下正确"和"并发下正确"完全不是一回事。
+
+于是这一阶段的全部设计压力都落在写路径上：**M3 的写路径是"一个写者持 `db.mu`，
+从头到尾做完 WAL 追加 + fsync + MemTable 插入"**。它正确，但有两个后果：
+
+- **每个写者各做一次 fsync**。fsync 是写路径唯一的硬成本，N 个并发写者就要付 N 次；
+- **fsync 期间持有 `db.mu` 写锁**，读者的每一次点查都要排在磁盘等待后面。
+
+Group Commit 就是针对这两条：把同时排队的写者合并进一次 fsync，并且把 fsync
+挪到锁外。一句话概括：*写队列从 `db.mu` 里独立出来，队长替全组做一次 fsync*。
+
+| 文件 | 内容 |
+|---|---|
+| `db_write.go` | **新增**。写队列的全部实现：`writeRequest`、队长/跟随者模型、`runWriteGroup`（分配序列号 → 追加 → **一次 fsync** → 落 MemTable）、`finishWriteGroup`（发结论 + 决定队长是否续任）、`drainWrites`（关库前排队列）、`applyWriteGroup`、`failLocked` 的写侧入口 |
+| `db.go` | `Write` 从"持 `db.mu` 直接落盘"改成"排进写队列"；`DB` 新增 `wmu/wcond/wqueue/wleader/wclosing`；`Close` 前置 `drainWrites`；`Stats` 新增 `WriteGroups/WriteBatches/MaxWriteGroup/WALFsyncs/LiveSnapshots`；`counters` 同步扩充 |
+| `db_compact.go` | `setBgErr` 与新加的 `failLocked` 合并成**唯一一处"停库"入口**（持锁版本），写路径与后台路径共用 |
+| `db_iter.go` | `Snapshot` 的语义注释补齐（它护住的是旧版本，与迭代器的版本引用是两套机制，见 9.21） |
+| `db_concurrent_test.go` | **新增**。9 条并发用例：组提交合并率、关 SyncWrites 的对照组、并发写不丢记录不串号、批次原子可见、快照隔离、快照挡住 Compaction 丢弃、**写失败停库**、关闭与并发写的竞态、混合负载压测 |
+| `cmd/kvdb-bench/main.go` | 新增 `-mode group -writers 1,2,4,8,16,32`：按并发写者数扫描，输出 ops/s / 提交组数 / fsync 次数 / 合并率 / 每次 fsync 的墙钟代价；`printResult` 也补了组提交一行 |
+| `doc.go` | 包文档更新到 M4（原先还停在 M1） |
+
+### 9.19 M4 API 一览
+
+```go
+// ── package kvdb（db_write.go）
+//
+// 对外签名一个都没变，变的是 Write 的并发语义与失败语义。
+
+func (db *DB) Write(b *WriteBatch) error
+
+// 组提交：并发写者排进队列，队长替全组做一次 fsync。
+// 返回 nil 表示这一批已经落盘并对后续读可见；错误分两类：
+//   - ErrClosed / 已存在的后台错误 → 这一批一定没写进去；
+//   - 磁盘故障                     → 这一批可能已经写进去了，且整个库会停下。
+
+// 内部结构（不导出）：
+type writeRequest struct {
+    batch *WriteBatch
+    seq   uint64 // 起始序列号，由队长分配
+    err   error  // 由队长在 finishWriteGroup 里填
+    done  bool
+}
+
+func (db *DB) runWriteGroup() ([]*writeRequest, error)
+func (db *DB) beginWriteGroup(group []*writeRequest) (firstSeq, lastSeq uint64, log *wal.Log, err error)
+func (db *DB) appendWriteGroup(log *wal.Log, group []*writeRequest) error
+func (db *DB) applyWriteGroup(group []*writeRequest, firstSeq, lastSeq uint64, walErr error) error
+func (db *DB) takeWriteQueue() []*writeRequest
+func (db *DB) finishWriteGroup(group []*writeRequest, err error) (more bool)
+func (db *DB) drainWrites()
+
+const collectYields = 4 // 队长开始 fsync 前"让出调度"的次数，见 9.21
+
+// ── Stats 新增字段（db.go）
+
+type Stats struct {
+    // ...（M3 的字段不变）
+    WriteGroups   int64 // 提交组数
+    WriteBatches  int64 // 参与组提交的批次数，≈ Write 调用次数
+    MaxWriteGroup int64 // 观察到的最大组大小
+    WALFsyncs     int64 // 实际执行的 WAL fsync 次数；SyncWrites 为假时恒为 0
+    LiveSnapshots int   // 尚未 Release 的快照数
+}
+
+// 合并率 = WriteBatches / WriteGroups
+// fsync 摊销 = WriteBatches / WALFsyncs   ← 这个比值就是写吞吐相对"每条写一次 fsync"的倍数
+
+// ── 写路径的并发不变式（db_write.go 里以注释形式写死，测试逐条守住）
+
+// 1. len(wqueue) > 0 ⟹ wleader   —— 队列里有东西就一定有队长（finishWriteGroup 保证）
+// 2. db.lastSeq 只在整组落进 MemTable 之后推进 —— 读者不会看到未落地的"已提交点"
+// 3. 整组在同一个 db.mu 临界区里应用       —— 不存在"半组可见"
+// 4. Close 与写入之间没有中间态            —— drainWrites 排空队列之后才轮到 db.closed
+```
+
+### 9.20 M4 验收结果
+
+验收标准是**"并发压测下 race detector 无告警"**。但"没有告警"本身太弱 ——
+一个把写入彻底串行化的实现同样没有告警。所以下面按三段交代：① 竞态检测；
+② 组提交真的在合并 fsync（这是 M4 唯一改变写路径吞吐行为的地方，也是它存在的
+全部理由）；③ 几条在任何交错下都必须成立的不变式，以及它们被哪条用例锁住。
+
+**① race detector 无告警**
+
+```text
+$ go test -race ./... -count=1
+ok      kvdb                    38.997s
+ok      kvdb/internal/cache      2.486s
+ok      kvdb/internal/compact    3.075s
+ok      kvdb/internal/crc        2.070s
+ok      kvdb/internal/filter     2.249s
+ok      kvdb/internal/iterator   2.207s
+ok      kvdb/internal/key        2.191s
+ok      kvdb/internal/memdb      2.198s
+ok      kvdb/internal/sst        2.562s
+ok      kvdb/internal/version    2.742s
+ok      kvdb/internal/wal        2.276s
+```
+
+M4 新增的并发结构全部通过：写队列（队长/跟随者 + 条件变量）、`Close` 与在途提交的
+握手、以及"把 fsync 挪出 db.mu"带来的读者-写者新交错。
+
+**② 组提交的合并率** —— `kvdb-bench -mode group -writes 3000 -writers 1,2,4,8,16,32`
+（本机 Windows / go1.27.1 / `SyncWrites = true`；写者各自写一段不重叠的 key 空间，
+写完逐个读回校验）：
+
+| writers | ops/s | 提交组数 | **fsync 次数** | **合并率** | 最大组 | us/write | us/fsync |
+|---|---|---|---|---|---|---|---|
+| 1 | 487 | 3000 | 3000 | 1.00 | 1 | 2053 | 2053 |
+| 2 | 975 | 1527 | 1527 | 1.96 | 2 | 1026 | 2015 |
+| 4 | 1934 | 774 | 774 | 3.88 | 4 | 517 | 2004 |
+| 8 | 3813 | 388 | 388 | 7.73 | 8 | 262 | 2028 |
+| 16 | 6689 | 205 | 205 | 14.63 | 16 | 150 | 2188 |
+| 32 | **12504** | 110 | **110** | **27.27** | 32 | 80 | 2181 |
+
+（"提交组数"与"fsync 次数"逐行相等不是笔误：`SyncWrites = true` 时一组恰好一次 fsync，
+这也是为什么合并率既能按组算也能按 fsync 算。关掉 `SyncWrites` 时后者恒为 0。）
+
+三件事同时被这张表说清楚了：
+
+- **写入吞吐 ×25.7（487 → 12504）、fsync 次数 ÷27.3（3000 → 110）**。写吞吐的分子
+  是用户写入、分母是 fsync，所以"ops/s 涨而 fsyncs 不涨"就是组提交在起作用的
+  **定义**，不需要额外论证。
+- **`us/fsync` 这一列几乎不动（2.0～2.2 ms）**。它说明 fsync 的代价是这台机器上一个
+  固定的物理量，W=1 时的 2053 µs/write 就是"一次 fsync 换一次写"的直接后果。
+  换句话说：这张表的每一行都受同一个常数约束，`ops/s ≈ 1000 / 2.1ms × 合并率`。
+- **合并率随写者数单调上升，接近 W-1 的上界**（32 个写者时平均 22～28，三次重复
+  实测为 27.78 / 22.39 / 27.27）。它没有等于 W-1，原因见 9.21 里 `collectYields` 那条。
+
+单测层面把同一件事固化成断言（`TestGroupCommitAmortizesFsync`）：16 个并发写者各写
+64 次，断言 `WriteBatches == 1024`、`WALFsyncs > 0`、**`WALFsyncs < WriteBatches`**、
+`MaxWriteGroup >= 2`。配套的对照组 `TestWALFsyncsDisabledWhenSyncWritesOff` 断言
+`SyncWrites = false` 时 `WALFsyncs == 0` —— 没有这条，上面那个"≪"就不能说明任何事。
+
+**③ 并发下的不变式与它们对应的用例**
+
+| 不变式 | 用例 | 断言方式 |
+|---|---|---|
+| 并发写不丢记录、不串号 | `TestConcurrentWritersKeepAllRecords` | 8 写者 × 200 条，全部读回；且 `LastSequence` 恰好 == 1600（序列号必须**稠密**：重号会偏小、跳号会偏大） |
+| **批次原子性在并发下成立** | `TestWriteBatchesStayAtomicUnderConcurrentWrites` | 每个批次把同一个值写进一对 key，4 个读者在同一快照上读这一对，要求"都没出现 / 都是同一个值"，绝不允许一边有一边无 |
+| 快照隔离 | `TestConcurrentOverwritesThenSnapshotIsolation` | 4 写者猛覆盖同一个 key，读者在快照内连读两次必须完全一致 |
+| 存活快照挡住旧版本丢弃 | `TestSnapshotPinsOldVersionsAcrossCompaction` | 取快照 → 大量覆盖写逼出多轮 Compaction → 快照仍读到 v1；`Release` 后读到 v2、`LiveSnapshots` 归 0 |
+| **写失败 = 整组失败 + 停库** | `TestWALFailureStopsTheDatabase` | 关掉日志句柄制造真实写失败：失败的那批读不到、之前的写入不受影响、后续写入拿到同一个错误、**只读仍然可用** |
+| 关库与在途写不互相等待 | `TestCloseWhileWritersRunning` | 8 个写者边写边关库（5 轮）：写入只允许返回 nil 或 `ErrClosed`，`Close` 必须返回，关库后的 `Put` 立刻拿 `ErrClosed` 而不是挂住 |
+| 混合负载（写 + 点查 + 快照 + 扫描 + Flush + Compaction） | `TestConcurrentMixedWorkload` | 迭代顺序严格递增、值形态合法、收尾逐条复核；这条是用例里最能压到竞态的（也是 `-race` 下的主要负载） |
+
+**④ 测试与静态检查**：`go test ./... -count=1 -cover` 全绿 —— kvdb 84.2%、
+cache 96.8%、compact 86.9%、crc 100%、filter 94.4%、iterator 86.1%、key 98.1%、
+memdb 98.6%、sst 76.2%、version 78.5%、wal 84.5%（kvdb 包比 M3 的 83.0% 略有回升，
+因为新加的并发用例把 `db.go` 上原先只有异常路径才走到的分支盖住了）；
+`go vet ./...` 与 `gofmt -l .` 无输出。
+
+> **一条需要如实说明的边界**：写路径上那几个**致命错误分支**（`appendWriteGroup`
+> 里的 fsync 失败、`beginWriteGroup` 里 `db.closed` 的兜底）在正常测试里走不到。
+> 前者由 `TestWALFailureStopsTheDatabase` 用"关掉日志句柄"制造，后者**不可达**——
+> 因为 `drainWrites` 先关门、再等队长、最后才允许 `Close` 置 `db.closed`，
+> 于是"已关库但仍在提交"这个状态根本不存在。它作为防御性检查保留，但不计入覆盖率。
+
+### 9.21 M4 期间新增 / 细化的决策
+
+| 决策 | 结论与理由 |
+|---|---|
+| **写队列用自己的一把锁（`wmu`），不复用 `db.mu`** | `db.mu` 保护的是全局状态（MemTable、版本、序列号水位），而队列要解决的是"谁来做这次 fsync"。混在一起就会出现"写者为了排队而拿写锁"的荒唐局面。分开之后队长做 fsync 时**既不持 `db.mu`（读者照常读），也没有让别人空等（后来的写者只是在队尾排队，正好凑成下一组）**。"多少个写者合并进一次 fsync"因此完全由并发度决定，不需要任何启发式。 |
+| **队长必须"排空队列才让位"，不能"提交一组就让位"** | 这是 M4 里唯一一个**实测挂死过**的设计错误。原先的写法是"提交完这一组 → 清空 `wleader` → 广播"，但队长清空 `wleader` 的那一瞬间，队列里可能还留着刚刚排进来的写者 —— 它们看到的 `wleader` 已经是 false，于是谁也不会去提交它们，那批写者永远等不到 `done`。现象是 16 个 goroutine 全部卡在 `wcond.Wait` 而场上**没有队长**。修法是把"还要不要继续当队长"和"清空 `wleader`"放进同一个 `wmu` 临界区：队列非空就继续当队长，队列空才让位。由此得到一条有用的不变式：**`len(wqueue) > 0 ⟹ wleader`**，队列里有东西就一定有队长。 |
+| **`finishWriteGroup` 必须先写 `done` 再 `Broadcast`** | 反过来的话，被唤醒的写者可能重新检查时看到 `done == false` 又回去睡，而此刻已经没有人会再唤醒它。这类丢失唤醒一旦发生就是不可恢复的挂起，所以顺序在这里是语义的一部分，不只是风格问题。 |
+| **`drainWrites` 必须"先关门、再等队长"** | 关库要等队列排空。如果先等队长停下来再关门，那么在持续写入的负载下队长永远有人可提交、队列永远不空，`Close` 会一直等下去（测试里表现为超时）。先把 `wclosing` 置上、把新写者挡在 `ErrClosed` 之外，队列就只会变短，队长一定能停。 |
+| **队列排空必须排在 `Close` 拿 `db.mu` 之前** | 队长在后半段要拿 `db.mu`（把整组落进 MemTable），而 `Close` 一旦先拿住 `db.mu` 再去等队长，两边就是互相等待。锁序被固定为：`wmu`（且不重叠持有）→ `db.mu`。 |
+| **`collectYields = 4`：队长开始 fsync 之前让出几次调度** | 队长由"第一个到达的写者"担任，而它到达时队列里往往只有它自己 —— 上一组刚被放行的写者还没走完"唤醒 → 返回 `Write` → 返回 `Put` → 重新入队"这几步。结果每组退化成"1 个 + (N-1) 个"交替，**一半的 fsync 浪费在只有队长自己的那一组上**。让出几次调度等价于"让已经就绪的写者先跑一步"：不睡眠、不等固定时长，代价几微秒，相对一次 2 ms 的 fsync 可以忽略。实测（32 写者 × 3000 次写）把合并率从 **15.87 提到 22.4～27.8**，即吞吐再涨四到七成。这是本项目里唯一一处"调度层面的主动让步"，它换来的是实打实的 2 倍吞吐。 |
+| **组提交失败 = 整组失败，并且整个库停下来** | 一条批次是原子的，但一个**提交组**不是：组里靠前的批次可能已经进了 WAL，靠后的没有。这时候如果只把错误返回给失败的那几个写者、然后继续服务，就会出现"返回了错误但其实写成功了"—— 调用方据此重试会重复写、据此放弃会丢数据，而且**不报任何错**。所以规定：组内任何一步出错，整组一起失败，并记入 `bgErr` 让后续写入一律返回同一个错误。`Write` 的错误因此分成两类并有明确语义：`ErrClosed`/既有后台错误 → 一定没写进去；磁盘故障 → **可能写进去了，库已停止，重开即可**（WAL 始终是唯一的事实来源）。 |
+| **整组在同一个 `db.mu` 临界区里应用，`lastSeq` 最后才推进** | 这是"批次原子性"在并发下的表现形式，也是它和组提交不冲突的原因：读者要么看到 `lastSeq` 停在组前（整组都不可见），要么看到组后（整组都可见），**不存在"半组可见"**。序列号则在 `beginWriteGroup` 里就先分配好了 —— 它就写在 WAL 记录头里，必须先定；但那时**不能**抬高 `db.lastSeq`，因为那同时也是读者的快照水位，提前抬高等于让读者看到一个尚未落地的"已提交点"。 |
+| **快照与迭代器是两套机制，不要合并** | 快照只记序列号，靠**登记**抬高 `smallestSnapshot`，作用对象是**旧版本**；迭代器持有**版本引用**，靠引用计数让那批**输入文件**在读完前删不掉，作用对象是**文件**。迭代器读的永远是它打开那一刻的那批文件，而 Compaction 只会写新文件，所以迭代器**不需要**也**不应该**登记快照 —— 给它登记的话，一个长命迭代器会把丢弃上界永久钉死，白白拦住旧版本回收。（9.16 里原有一句"打开迭代器时登记存活快照"与代码不符，M4 核实时订正。） |
+| **`Close` 与写入之间刻意不留中间态** | `drainWrites` 的次序决定了"已关库但仍在提交"这个状态不存在，所以写路径上两处 `db.closed` 检查是**防御性**的、正常路径不可达。这是刻意的取舍：宁可留两行走不到的守卫，也不要让"关库过程中还能写进去一条"这种窗口存在 —— 那种窗口在真实故障里最难复现也最难解释。 |
+| **把"合并率"做成指标而不是只报墙钟** | 组提交的效果如果只用 ops/s 表达，会被机器、磁盘、缓存干扰得无法比较。`WriteBatches / WriteGroups`（合并率）与 `WriteBatches / WALFsyncs`（每次 fsync 摊销多少次写）是两个与机器无关的比值，它们直接说出"省了多少 fsync"；`WALFsyncs` 在关掉 `SyncWrites` 时恒为 0，天然给了自己一个对照组。`MaxWriteGroup` 则是"实际最多同时有几个写者在跑"的观测。 |
+| **`LiveSnapshots` 作为快照遗忘的观测口** | 忘记 `Release` 不会读错数据，只是让旧版本一直留在磁盘上 —— 这是一种**没有症状的错误**。把存活快照数放进 `Stats`，它就成了唯一能看见这件事的地方；`TestSnapshotPinsOldVersionsAcrossCompaction` 同时断言取快照后为 1、`Release` 后为 0。 |
 
 ---
 
@@ -1049,6 +1247,18 @@ type DB interface {
 M3 为它补上了两个诊断入口：`Stats()`（分层布局 + 读写放大）与 `RecoveryReport()`（恢复时丢弃了什么），
 两者都不改变上面的读写语义。
 
+**截至 M4，`Write` 的并发与失败语义被正式定义**（见 9.19），其余签名一个都没变：
+
+- 并发写者由写队列合并进组提交，**队首的写者替全组做一次 fsync**；
+- `Write` 返回 nil ⇒ 这一批已落盘（`SyncWrites` 为真时）且对后续读可见；
+- 返回 `ErrClosed` 或之前已存在的后台错误 ⇒ 这一批**一定没有**写进去；
+- 返回磁盘故障 ⇒ 这一批**可能**已经写进去了，同时整个库会停下来（后续写入一律返回
+  同一个错误），重开数据库即可正确恢复。
+
+`Stats()` 在 M4 里增加了 `WriteGroups / WriteBatches / MaxWriteGroup / WALFsyncs /
+LiveSnapshots` 五个观测口 —— 组提交的效果如果只用 ops/s 表达会被机器差异淹没，
+而"合并率 = `WriteBatches / WriteGroups`"是一个与机器无关、直接说明省了多少 fsync 的比值。
+
 ---
 
 ## 附录 C：包结构
@@ -1060,10 +1270,12 @@ kvdb/
 ├── go.mod                  # [M0 已完成] module kvdb
 ├── doc.go                  # [M0 已完成] 包级文档
 ├── options.go              # [M0 已完成] Options / Comparer
-├── db.go                   # [M1 已完成 / M2 扩充] DB 对外接口、读写路径、冻结 Immutable、块缓存
-├── db_flush.go             # [M1 已完成 / M2 扩充] 恢复（目录扫描 + WAL 重放）、后台 Flush、五段式落盘
+├── db.go                   # [M1 已完成 / M2 扩充 / M4 接组提交] DB 对外接口、读路径、冻结 Immutable、块缓存、写队列状态
+├── db_write.go             # [M4 已完成] 组提交：写队列、队长/跟随者、一次 fsync 服务整组、关库前排空队列
+├── db_flush.go             # [M1 已完成 / M2 扩充 / M3 扩充] 恢复（目录扫描 + WAL 重放）、后台 Flush、五段式落盘
 ├── db_iter.go              # [M2 已完成] NewIterator / GetSnapshot / Snapshot / 导出迭代器接口
-├── batch.go                # [M1 已完成] WriteBatch 与它的二进制编解码
+├── batch.go                # [M1 已完成] WriteBatch 与它的二进制编解码（M4 的原子性载体，无需改动）
+├── db_concurrent_test.go   # [M4 已完成] 并发一致性：组提交合并率、批次原子可见、快照隔离、停库语义、关库竞态
 ├── file_lock_windows.go    # [M1 已完成] 目录锁（LockFileEx，随进程消亡释放）
 ├── file_lock_unix.go       # [M1 已完成] 目录锁（flock）
 ├── docs/
@@ -1083,7 +1295,8 @@ kvdb/
 │   ├── version/            # [M3 已完成] Manifest 追加日志、CURRENT、VersionSet、版本引用计数、VersionEdit
 │   └── compact/            # [M3 已完成] Compaction Picker（L0 按文件数 / L1+ 按容量）与多路归并执行
 └── cmd/
-    └── kvdb-bench/         # [M1 雏形 / M2 扩充读路径 / M3 补放大统计 / M5 完整] write / point / scan / sweep
+    └── kvdb-bench/         # [M1 雏形 / M2 扩充读路径 / M3 补放大统计 / M4 补组提交统计 / M5 完整]
+                            # write / point / scan / sweep / group
 ```
 
 ---
@@ -1106,6 +1319,12 @@ kvdb/
 | Compaction 每次只往下走一层，不做跨层归并 | 一次跨多层的归并会把写入量放大到不可控，而且中间层的旧版本会被同时清掉，出错时无法定位是哪一层的问题 |
 | 输出文件只在 user key 变化处切分 | 「同一 user key 的所有版本必须同文件」这条不变式的写侧等价物；在 internal key 中间切会把一个 key 的版本劈到两个文件里，点查只读一个文件时就会漏版本 |
 | 读到比 `smallestSnapshot` 更旧的版本即可丢 | 丢掉任何存活快照还要读的版本都是静默的数据损坏（读到新值，或本该存在的值变成不存在）且不报错；取所有存活快照的最小值是这个上界的唯一安全选择 |
+| 写队列独立于 `db.mu`，fsync 在锁外做 | 写者为了排队去拿全局写锁，就等于让每次 fsync 都堵住所有读者；分开之后"多少个写者合并进一次 fsync"完全由并发度决定，不需要启发式 |
+| 队长排空队列才让位 | "提交一组就让位"会在让位的那一瞬间把刚排进来的写者变成没人负责的孤儿 —— 它们永远等不到通知（实测挂死） |
+| 组提交失败 = 整组失败 + 整库停写 | 一条批次是原子的，一个提交组不是；"返回了错误但其实写成功了"会让调用方的重试变成重复写、放弃变成丢数据，且不报错 |
+| 整组在同一个临界区里落库，序列号水位最后推进 | 批次原子性在并发下的表现形式：读者要么整组可见、要么整组不可见，不存在"半组可见"；序列号先分配是因为它写在 WAL 记录头里，而水位后推进是因为它同时是读者的快照水位 |
+| 快照靠**登记**、迭代器靠**版本引用** | 两者作用在不同对象上（旧版本 vs 输入文件），各自解决一半问题；给迭代器也登记快照反而会把丢弃上界永久钉死，白拦旧版本回收 |
 
 （M2 期间更细的决策 —— 过滤器损坏时的保守策略、索引记 max key、`ErrLegacyFormat` 不可容忍等 —— 见 9.13。
-M3 期间更细的决策 —— 孤儿文件的两类区分、`unrefLocked` 规避自死锁、按编号删旧 Manifest、关库兜底 GC 等 —— 见 9.17。）
+M3 期间更细的决策 —— 孤儿文件的两类区分、`unrefLocked` 规避自死锁、按编号删旧 Manifest、关库兜底 GC 等 —— 见 9.17。
+M4 期间更细的决策 —— 丢失唤醒的修法、`drainWrites` 的次序、`collectYields`、停库语义、快照与迭代器的分工等 —— 见 9.21。）

@@ -11,12 +11,20 @@
 //	       —— 验证"读延迟不再随文件数线性增长"；默认还会跑一组
 //	       "关闭 Bloom 与块缓存"的对照，用来说明曲线变平确实是这些优化的功劳
 //
+// M4 补齐了写路径的一致性（Snapshot / WriteBatch / Group Commit），于是增加：
+//
+//	group  在一组不同的并发写者数下重复"并发写 -> 读回校验"
+//	       —— 验证组提交把并发写请求合并进了更少的 fsync。
+//	       SyncWrites 打开时写吞吐的天花板就是 fsync 次数，所以这一模式下
+//	       ops/s 随写者数上升、而 fsync 次数几乎不动，正是组提交在起作用。
+//
 // 用法：
 //
 //	go run ./cmd/kvdb-bench -mode all   -n 100000
 //	go run ./cmd/kvdb-bench -mode sweep -n 200000 -files 1,4,16,64
+//	go run ./cmd/kvdb-bench -mode group -writes 2000 -writers 1,2,4,8,16,32
 //
-// YCSB 式负载、读写混合比例与各层放大系数留到 M5。
+// YCSB 式负载与各层放大系数留到 M5。
 package main
 
 import (
@@ -28,6 +36,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"kvdb"
@@ -47,6 +56,7 @@ const (
 	modePoint = "point" // 只做点查
 	modeScan  = "scan"  // 只做范围扫描
 	modeSweep = "sweep" // 按文件数扫描（每次重建数据集）
+	modeGroup = "group" // 按并发写者数扫描（组提交）
 )
 
 type config struct {
@@ -70,6 +80,10 @@ type config struct {
 	sample    int
 	files     []int
 	variants  bool
+
+	writes     int
+	writerList []int
+	groupSync  bool
 }
 
 func run() error {
@@ -93,6 +107,10 @@ func run() error {
 		seed        = flag.Int64("seed", 1, "随机数种子（便于复现）")
 		files       = flag.String("files", "1,4,16,64", "sweep 模式下要测试的 SST 文件数列表")
 		variants    = flag.Bool("variants", true, "sweep 模式下同时跑一组对照（关闭 Bloom 与块缓存）")
+
+		writes     = flag.Int("writes", 2000, "group 模式下每档的总写入次数")
+		writerList = flag.String("writers", "1,2,4,8,16,32", "group 模式下要测试的并发写者数列表")
+		groupSync  = flag.Bool("group-sync", true, "group 模式下是否每条写都 fsync（组提交只有开着它才有意义）")
 	)
 	flag.Parse()
 
@@ -116,6 +134,9 @@ func run() error {
 		seed:      *seed,
 		sample:    *printSample,
 		variants:  *variants,
+
+		writes:    *writes,
+		groupSync: *groupSync,
 	}
 	if cfg.lookups <= 0 {
 		cfg.lookups = cfg.numKeys
@@ -145,10 +166,16 @@ func run() error {
 			return err
 		}
 		return runSweep(cfg, sizes)
+	case modeGroup:
+		ws, err := parseFileList(*writerList)
+		if err != nil {
+			return err
+		}
+		return runGroup(cfg, ws)
 	case modeAll, modeWrite, modePoint, modeScan:
 		return runOnce(cfg)
 	default:
-		return fmt.Errorf("unknown -mode %q (want all|write|point|scan|sweep)", cfg.mode)
+		return fmt.Errorf("unknown -mode %q (want all|write|point|scan|sweep|group)", cfg.mode)
 	}
 }
 
@@ -320,6 +347,191 @@ func runSweepCase(base config, v sweepVariant, want int) (sweepPoint, error) {
 		missUS:  usPerOpValue(res.getMiss, res.getMissOps),
 		hitRate: hitRate(stats.CacheHits, stats.CacheMisses),
 	}, nil
+}
+
+// ── group：按并发写者数扫描（组提交） ────────────────────────────
+//
+// 这一模式是 M4 的验收工具。写性能的天花板由 fsync 次数决定（见 docs/DESIGN.md §3），
+// 所以只要把 SyncWrites 打开，"每秒能 fsync 多少次"就是写吞吐的上限。
+//
+// M3 的写路径里每个写者各做一次 fsync，并发只会让它们排队；M4 的组提交把同一时刻
+// 排队的写者合并进一次 fsync，于是 ops/s 随写者数上升而 fsyncs 这一列几乎不动。
+// 两列放在一起看，"组提交到底省了多少 fsync"就不需要靠论证了。
+
+// groupPoint 是一档并发写者数下的测量结果。
+type groupPoint struct {
+	writers  int
+	elapsed  time.Duration
+	batches  int64 // 写入次数（= 参与组提交的批次数）
+	groups   int64 // 提交组数
+	fsyncs   int64 // 实际执行的 WAL fsync 次数
+	maxGroup int64 // 观察到的最大组大小
+}
+
+// opsPerSec 是写入吞吐。
+func (p groupPoint) opsPerSec() float64 {
+	if p.elapsed <= 0 {
+		return 0
+	}
+	return float64(p.batches) / p.elapsed.Seconds()
+}
+
+// merge 是平均一组合并了多少个写者，也就是"每次 fsync 摊销了几次写"。
+func (p groupPoint) merge() float64 {
+	if p.groups == 0 {
+		return 0
+	}
+	return float64(p.batches) / float64(p.groups)
+}
+
+// usPerFsync 是分摊到每次 fsync 的墙钟时间。它近似于这台机器上一次 fsync 的代价，
+// 也是"ops/s 为什么涨不上去"的直接解释。
+func (p groupPoint) usPerFsync() float64 {
+	if p.fsyncs == 0 {
+		return 0
+	}
+	return float64(p.elapsed.Microseconds()) / float64(p.fsyncs)
+}
+
+func runGroup(base config, writerCounts []int) error {
+	opts := buildOptions(base, "")
+	fmt.Println("kvdb-bench group（组提交）")
+	fmt.Printf("  writes/case      %d\n", base.writes)
+	fmt.Printf("  value size       %d bytes\n", base.valueSize)
+	fmt.Printf("  memtable size    %d bytes\n", opts.MemTableSize)
+	fmt.Printf("  sync writes      %v\n", base.groupSync)
+	fmt.Printf("  writer counts    %v\n", writerCounts)
+	fmt.Println()
+	fmt.Printf("  %-8s %-11s %-9s %-9s %-8s %-6s %-10s %-9s\n",
+		"writers", "ops/s", "groups", "fsyncs", "merge", "max", "us/write", "us/fsync")
+	fmt.Printf("  %-8s %-11s %-9s %-9s %-8s %-6s %-10s %-9s\n",
+		"-------", "-----", "------", "------", "-----", "---", "--------", "--------")
+
+	points := make([]groupPoint, 0, len(writerCounts))
+	for _, w := range writerCounts {
+		p, err := runGroupCase(base, w)
+		if err != nil {
+			return fmt.Errorf("writers=%d: %w", w, err)
+		}
+		points = append(points, p)
+		fmt.Printf("  %-8d %-11.0f %-9d %-9d %-8.2f %-6d %-10.1f %-9.1f\n",
+			p.writers, p.opsPerSec(), p.groups, p.fsyncs, p.merge(), p.maxGroup,
+			usPerOpValue(p.elapsed, int(p.batches)), p.usPerFsync())
+	}
+
+	fmt.Println()
+	fmt.Println("  " + describeGroupScaling(points))
+	fmt.Println("  判读方式：sync writes 为 true 时，ops/s 的上限就是「每秒能做多少次 fsync」。")
+	fmt.Println("  看 ops/s 与 fsyncs 两列的走向：ops/s 涨而 fsyncs 不跟着涨，说明多出来的")
+	fmt.Println("  写入被合并进了同一批 fsync —— merge 这一列就是每次 fsync 摊销的写次数。")
+	return nil
+}
+
+// runGroupCase 跑一档：W 个写者并发写 total 条（key 空间互不重叠），然后读回校验。
+func runGroupCase(base config, writers int) (groupPoint, error) {
+	if writers < 1 {
+		return groupPoint{}, errors.New("writers must be >= 1")
+	}
+	cfg := base
+	cfg.dir = ""
+	cfg.sync = base.groupSync
+
+	dir, cleanup, err := prepareDir(cfg)
+	if err != nil {
+		return groupPoint{}, err
+	}
+	defer cleanup()
+
+	db, err := openDB(cfg, dir, false)
+	if err != nil {
+		return groupPoint{}, err
+	}
+
+	// key 空间按写者切开：这样读回校验失败时能指出是谁写丢的。
+	per, extra := cfg.writes/writers, cfg.writes%writers
+	value := valueBytes(cfg)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	next := 0
+	for w := 0; w < writers; w++ {
+		n := per
+		if w < extra {
+			n++
+		}
+		from := next
+		next += n
+		wg.Add(1)
+		go func(from, n int) {
+			defer wg.Done()
+			<-start // 一起出发，才谈得上"同时排队"
+			for i := 0; i < n; i++ {
+				if err := db.Put(key(from+i), value); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(from, n)
+	}
+
+	begin := time.Now()
+	close(start)
+	wg.Wait()
+	elapsed := time.Since(begin)
+	close(errs)
+	for err := range errs {
+		_ = db.Close()
+		return groupPoint{}, err
+	}
+
+	if cfg.verify {
+		for i := 0; i < cfg.writes; i++ {
+			got, gerr := db.Get(key(i))
+			if gerr != nil {
+				_ = db.Close()
+				return groupPoint{}, fmt.Errorf("verify key #%d: %w", i, gerr)
+			}
+			if !bytes.Equal(got, value) {
+				_ = db.Close()
+				return groupPoint{}, fmt.Errorf("verify key #%d: value mismatch (%d bytes)", i, len(got))
+			}
+		}
+	}
+
+	stats := db.Stats()
+	if err := db.Close(); err != nil {
+		return groupPoint{}, err
+	}
+	return groupPoint{
+		writers:  writers,
+		elapsed:  elapsed,
+		batches:  stats.WriteBatches,
+		groups:   stats.WriteGroups,
+		fsyncs:   stats.WALFsyncs,
+		maxGroup: stats.MaxWriteGroup,
+	}, nil
+}
+
+// describeGroupScaling 把首尾两档放在一起比，避免读者自己去算倍数。
+func describeGroupScaling(points []groupPoint) string {
+	if len(points) < 2 {
+		return "写者数不足两档，无法比较"
+	}
+	first, last := points[0], points[len(points)-1]
+	return fmt.Sprintf(
+		"写者数 %d -> %d：ops/s ×%.1f，fsync 次数 ×%.2f，合并率 %.2f -> %.2f —— 吞吐涨而 fsync 没涨",
+		first.writers, last.writers,
+		ratioFloat(last.opsPerSec(), first.opsPerSec()),
+		ratioFloat(float64(last.fsyncs), float64(first.fsyncs)),
+		first.merge(), last.merge())
+}
+
+func ratioFloat(num, den float64) float64 {
+	if den == 0 {
+		return 0
+	}
+	return num / den
 }
 
 // describeSlope 用最小二乘拟合 get(hit) 对文件数的斜率，并给出总量对比。
@@ -641,6 +853,24 @@ func printResult(cfg config, res *result, db *kvdb.DB) {
 	if stats.Gets > 0 {
 		fmt.Printf("  read amp         %.2f probes/get (gets=%d probes=%d)\n",
 			float64(stats.ReadProbes)/float64(stats.Gets), stats.Gets, stats.ReadProbes)
+	}
+
+	// ── 组提交（M4）──
+	// 写入次数与 fsync 次数的比值就是组提交的合并率。SyncWrites 为真时它直接决定
+	// 写吞吐的天花板；为假时这一行只有合并率可看（fsyncs 恒为 0）。
+	if stats.WriteBatches > 0 {
+		merge := ratioFloat(float64(stats.WriteBatches), float64(stats.WriteGroups))
+		if stats.WALFsyncs > 0 {
+			fmt.Printf("  group commit     %d writes / %d groups = %.2f merge, %d wal fsyncs (%.2f writes per fsync, max group %d)\n",
+				stats.WriteBatches, stats.WriteGroups, merge, stats.WALFsyncs,
+				ratioFloat(float64(stats.WriteBatches), float64(stats.WALFsyncs)), stats.MaxWriteGroup)
+		} else {
+			fmt.Printf("  group commit     %d writes / %d groups = %.2f merge, wal fsyncs disabled (max group %d)\n",
+				stats.WriteBatches, stats.WriteGroups, merge, stats.MaxWriteGroup)
+		}
+	}
+	if stats.LiveSnapshots != 0 {
+		fmt.Printf("  live snapshots   %d（还有快照没 Release，旧版本暂时清不掉）\n", stats.LiveSnapshots)
 	}
 
 	// ── Compaction 规模 ──

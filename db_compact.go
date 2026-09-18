@@ -189,10 +189,22 @@ func (db *DB) recordCompaction(res compact.Result) {
 func (db *DB) setBgErr(err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	db.failLocked(err)
+}
+
+// failLocked 记下让整个库停止服务的错误。调用方必须持有 db.mu 的写锁。
+//
+// "停下来"而不是"继续试"是刻意的：会走到这里的错误（日志写失败、MemTable 冻结失败、
+// 后台落盘或合并失败）都意味着内存与磁盘已经开始不一致，继续接受写入只会把不一致放大。
+// 停库比静默地写坏数据好 —— 重开数据库即可，WAL 仍然是唯一的事实来源。
+func (db *DB) failLocked(err error) {
+	if err == nil {
+		return
+	}
 	if db.bgErr == nil {
 		db.bgErr = err
 	}
-	db.cond.Broadcast()
+	db.cond.Broadcast() // 唤醒等在 Immutable 落盘上的写者，让它拿到这个错误
 }
 
 // closeReaders 关闭一组读取器。

@@ -34,14 +34,15 @@ var batchPool = sync.Pool{New: func() any { return NewWriteBatch() }}
 
 // DB 是一个嵌入式 KV 存储引擎实例。所有导出方法都可并发调用。
 //
-// 写路径：WriteBatch 编码成一条 WAL 记录 → fsync → 写入 MemTable。
+// 写路径（M4 起是组提交）：并发写者排进一条写队列 → 队首那个写者替全组做一次
+// WAL 追加 + 一次 fsync → 整组一起落进 MemTable。细节见 db_write.go。
 // 读路径：MemTable → Immutable MemTable → 当前版本里的 SST
 // （L0 从新到旧逐个试，L1 以下每层二分定位一次；每层内部走索引二分 + Bloom + 块缓存）。
 //
-// 并发模型（M3 之后）：
+// 并发模型（M4 之后）：
 //
-//	写者                持 db.mu 写锁，串行
-//	读者                持 db.mu 读锁，互不阻塞
+//	写者                在写队列里排队，队长串行提交；两个临界区各持一次 db.mu
+//	读者                持 db.mu 读锁，互不阻塞；**不被 fsync 阻塞**
 //	后台 Flush 协程      只在"取任务"和"提交"时短暂持锁，落盘全程不持锁
 //	后台 Compaction 协程 同上；它额外持有一个 Version 引用，保证输入文件在归并期间不被删除
 //
@@ -77,6 +78,21 @@ type DB struct {
 	imm  *memdb.MemTable // 只读，等待后台落盘；nil 表示没有
 	log  *wal.Log
 
+	// ── 写队列（Group Commit，M4）────────────────────────────────
+	//
+	// wmu 与 db.mu 是分工关系，不是同一个东西：db.mu 保护全局状态
+	// （MemTable、版本、序列号水位），wmu 只保护写队列本身。
+	//
+	// 分开的理由是 fsync：如果写者拿 db.mu 去做 fsync，读者会被一次磁盘
+	// 等待堵住。分开之后队长做 fsync 时既不持 db.mu（读者照常读），也只是
+	// 让后来的写者排在队尾而不是空等 —— 队列因此自动攒成一组，
+	// "多少个写者合并进一次 fsync"完全由并发度决定。
+	wmu      sync.Mutex
+	wcond    *sync.Cond // 跟随者在此等待队长发结论
+	wqueue   []*writeRequest
+	wleader  bool // 已有队长在提交
+	wclosing bool // Close 已经开始，不再接受新写者
+
 	lastSeq uint64
 	bgErr   error
 	closed  bool
@@ -105,6 +121,14 @@ type counters struct {
 	walBytes   atomic.Uint64 // 写进 WAL 的负载字节数
 	flushFiles atomic.Int64
 	flushBytes atomic.Uint64
+
+	// 组提交的规模：写批次被合并成多少个提交组、以及实际调用了多少次 fsync。
+	// 合并率 = writeBatches / writeGroups，它就是并发写吞吐相对"每条写一次 fsync"
+	// 的倍数；walSyncs 是这件事最直接的证据（它 ≪ writeBatches）。
+	writeGroups   atomic.Int64
+	writeBatches  atomic.Int64
+	maxWriteGroup atomic.Int64
+	walSyncs      atomic.Int64
 
 	gets       atomic.Int64 // 点查次数
 	readProbes atomic.Int64 // 点查时"向某个 SST 发起查找"的次数，读放大 = 它 / gets
@@ -190,6 +214,30 @@ type Stats struct {
 	// 真正让次数下降的是 Compaction 把 L0 收敛成 L1 以下的分层结构。
 	Gets       int64
 	ReadProbes int64
+
+	// ── M4：组提交规模 ──────────────────────────────────────────────
+	//
+	// WriteGroups 是提交组数，WriteBatches 是参与组提交的批次数（≈ Write 调用次数），
+	// MaxWriteGroup 是观察到的最大组大小，WALFsyncs 是实际执行的 WAL fsync 次数。
+	//
+	// 这四个数把组提交的效果变得可量化：
+	//
+	//	合并率   = WriteBatches / WriteGroups   "平均多少个写者共用一次 fsync"
+	//	fsync 数 = WALFsyncs                    SyncWrites 为假时恒为 0
+	//
+	// SyncWrites 为真时 WALFsyncs 是吞吐的硬上限来源：它比 WriteBatches 小多少倍，
+	// 吞吐就有多少倍的余量。
+	WriteGroups   int64
+	WriteBatches  int64
+	MaxWriteGroup int64
+	WALFsyncs     int64
+
+	// LiveSnapshots 是尚未 Release 的快照数量。
+	//
+	// 它同时是"旧版本能不能被丢弃"的依据：只要有一个存活快照，Compaction 就必须
+	// 保留它还需要读的那些版本。这个数长期不归零，说明有快照忘了 Release ——
+	// 不会读错数据，但旧版本会一直留在磁盘上。
+	LiveSnapshots int
 }
 
 // LevelStats 是单层的规模。
@@ -224,11 +272,12 @@ func (db *DB) Stats() Stats {
 		memSize = db.mem.ApproximateSize()
 	}
 	s := Stats{
-		Files:        v.FileCount(),
-		MemTableSize: memSize,
-		HasImmutable: db.imm != nil,
-		LastSequence: db.lastSeq,
-		Levels:       levels,
+		Files:         v.FileCount(),
+		MemTableSize:  memSize,
+		HasImmutable:  db.imm != nil,
+		LastSequence:  db.lastSeq,
+		LiveSnapshots: len(db.snapshots),
+		Levels:        levels,
 		Compaction: CompactionStats{
 			Count:          db.counters.compactions.Load(),
 			InputFiles:     db.counters.compactionInputFiles.Load(),
@@ -237,10 +286,14 @@ func (db *DB) Stats() Stats {
 			OutputBytes:    db.counters.compactionOutputBytes.Load(),
 			DroppedRecords: db.counters.compactionDropped.Load(),
 		},
-		FlushBytes: db.counters.flushBytes.Load(),
-		WALBytes:   db.counters.walBytes.Load(),
-		Gets:       db.counters.gets.Load(),
-		ReadProbes: db.counters.readProbes.Load(),
+		FlushBytes:    db.counters.flushBytes.Load(),
+		WALBytes:      db.counters.walBytes.Load(),
+		Gets:          db.counters.gets.Load(),
+		ReadProbes:    db.counters.readProbes.Load(),
+		WriteGroups:   db.counters.writeGroups.Load(),
+		WriteBatches:  db.counters.writeBatches.Load(),
+		MaxWriteGroup: db.counters.maxWriteGroup.Load(),
+		WALFsyncs:     db.counters.walSyncs.Load(),
 	}
 	db.mu.RUnlock()
 
@@ -286,6 +339,7 @@ func Open(opts Options) (*DB, error) {
 	// 读路径会自动退化成"每读一块分配一次"。
 	db.blockCache = cache.New(opts.BlockCacheSize)
 	db.cond = sync.NewCond(&db.mu)
+	db.wcond = sync.NewCond(&db.wmu)
 	db.v = db.vset.Current()
 
 	if err := db.recover(); err != nil {
@@ -307,7 +361,13 @@ func Open(opts Options) (*DB, error) {
 // 它**不**把 MemTable 刷成 SST：内存里的数据本来就已经在 WAL 里了，
 // 下次 Open 时会重放并落盘。这样 Close 又快又简单，而且顺带把恢复路径
 // 变成每次都必然走一遍的常规路径。
+//
+// 顺序上有一步是 M4 新增且必须放在最前面的：**先把写队列排空**。
+// 提交队长在后半段要拿 db.mu，而 Close 一旦先拿住 db.mu 再等队长，两边就是互相等待。
 func (db *DB) Close() error {
+	// 等正在提交的那一组做完，并从此拒绝新的写者。做完之后队列一定是空的。
+	db.drainWrites()
+
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
@@ -378,53 +438,6 @@ func acquireDirLock(dir string) (*os.File, error) {
 		return nil, fmt.Errorf("%w: %s", ErrLocked, err)
 	}
 	return f, nil
-}
-
-// Write 原子地写入一个批次，是引擎唯一的写入口。
-//
-// Put / Delete 都只是它的语法糖。原子性来自"整个批次编码成一条 WAL 记录"：
-// 恢复时要么整条重放成功，要么整条被丢弃，不存在只应用一半的情况。
-func (db *DB) Write(b *WriteBatch) error {
-	if b == nil || b.Len() == 0 {
-		return nil
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return ErrClosed
-	}
-	if db.bgErr != nil {
-		// 后台 Flush 失败说明磁盘已经不可信，继续写只会让情况更糟。
-		return db.bgErr
-	}
-
-	seq := db.lastSeq + 1
-	b.SetSequence(seq)
-
-	record := b.Encode()
-	// 先写日志再动内存：fsync 成功才算这条写被确认。
-	if err := db.log.Append(record); err != nil {
-		return err
-	}
-	if db.opts.SyncWrites {
-		if err := db.log.Sync(); err != nil {
-			return err
-		}
-	}
-	db.counters.walBytes.Add(uint64(len(record)))
-	if err := b.Range(seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
-		db.mem.Add(seq, kind, userKey, value)
-		return true
-	}); err != nil {
-		return err
-	}
-	db.lastSeq = seq + uint64(b.Len()) - 1
-
-	if db.mem.ApproximateSize() >= int64(db.opts.MemTableSize) {
-		return db.freezeLocked()
-	}
-	return nil
 }
 
 // Put 写入一个键值对。value 允许为空。

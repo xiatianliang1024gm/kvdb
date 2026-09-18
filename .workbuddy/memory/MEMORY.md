@@ -13,7 +13,53 @@ internal/ 下按模块切分 key / memdb / wal / sst / filter / cache / version 
 ## 阶段进度
 - M0 骨架：**已完成**（2026-09-18）
 - M1 最小可用：**已完成**（2026-09-18）
-- M2 读优化 / M3 写优化 / M4 一致性 / M5 生产化：未开始
+- M2 读优化：**已完成**（2026-09-18）
+- M3 写优化：**已完成**（2026-09-18）
+- M4 一致性：**已完成**（2026-09-18）
+- M5 生产化：未开始
+
+## git
+已 init。基线 `6a375c1`（M0+M1+M2），`683e9c3`（M3）。
+中文 commit message 用 Write 写进 `_commitmsg.log` 再 `git commit -F`（`/_*.log` 已被忽略）。
+Bash 工具能跑 git 本身，但**别接管道**（coreutils 缺失）。
+
+## M4 确立的实现约定
+- 写队列用**自己的一把锁 `wmu`**，不复用 `db.mu`：`db.mu` 保护全局状态，
+  队列解决"谁来做这次 fsync"。分开才能做到 **fsync 在锁外做**（读者不被写者的磁盘等待堵住）
+- 锁序：`wmu`（且不重叠持有）→ `db.mu`。`Close` 的顺序是 **drainWrites → 再拿 db.mu**
+- **队长必须"排空队列才让位"**，不能"提交一组就让位"（后者会丢失唤醒：
+  让位瞬间队列里刚排进来的写者永远等不到 done。症状 = 一堆 goroutine 卡在 wcond.Wait 而场上没队长）
+  ⇒ 不变式 **`len(wqueue) > 0 ⟹ wleader`**
+- `finishWriteGroup` **先写 done 再 Broadcast**（反了会丢失唤醒且不可恢复）
+- `drainWrites` **先关门（wclosing=true）再等队长**：反过来在持续写入下队列永远不空，Close 永远等
+- 组提交三步：`beginWriteGroup`（分配序列号，**不动 db.lastSeq**）→
+  `appendWriteGroup`（追加 + **一次 fsync**，锁外）→ `applyWriteGroup`（整组在一个 db.mu 临界区里落库，
+  最后才推进 `db.lastSeq`）⇒ **不存在"半组可见"**
+- `collectYields = 4`：队长在 fsync 前 `runtime.Gosched()` 几次，把刚被放行的写者收进本组。
+  不加的话每组退化成"1 个 + (N-1) 个"交替，合并率只有 W/2
+- **失败语义**：组内任何一步出错 → 整组失败 + `bgErr` 停库（RocksDB 式）。
+  一条批次是原子的，一个**提交组**不是；"报错但写成功了"是比崩溃更难查的一致性缺口
+- `failLocked`（持有 db.mu 写锁）是**唯一**的停库入口，`setBgErr` 只是它的加锁包装
+- **快照与迭代器是两套机制，别合并**：快照靠**登记**（护旧版本，抬高 `smallestSnapshot`）；
+  迭代器靠**版本引用**（护输入文件）。给迭代器登记快照会把丢弃上界永久钉死
+- `Stats` 的组提交指标：`WriteGroups` / `WriteBatches` / `MaxWriteGroup` / `WALFsyncs`；
+  合并率 = `WriteBatches/WriteGroups`，fsync 摊销 = `WriteBatches/WALFsyncs`
+- 实测合并率：32 写者 → 22~28（us/fsync 恒定 2.0~2.2ms，是这台机器的固定物理量）
+
+
+## M3 确立的实现约定
+- `internal/version` 管版本：Manifest（复用 WAL 记录格式的追加日志）+ `CURRENT` + `VersionSet`；
+  `Version` 不可变、靠引用计数存活。`internal/compact` 管合并：`Pick` + `Run`。
+- **`VersionSet.mu` 内一律用 `unrefLocked`，绝不用 `Unref`**（后者归零时重入加锁 → 自死锁）
+- Compaction **每次只往下走一层**；输出**只在 user key 变化处切分**（同 key 版本必须同文件）；
+  `Inputs[1]`（输出层重叠文件）必须一起归并，否则"L1 以下同层不重叠"破掉
+- `Commit` 三步顺序固定：锁外开 reader → 锁内先登记 reader → 最后落 Manifest（否则有"版本已指向但读不到"的窗口）
+- 丢弃旧版本的上界 = `smallestSnapshot`（存活快照最小值，无快照时取 lastSeq）；迭代器打开即登记快照
+- 孤儿文件分两类：`DiscardedFiles`（残缺、根本不该存在）vs `ObsoleteFiles`（完整、提交没成功），判据"能否正常打开"
+- `LastSeq` 每次提交都写进 Manifest（只靠重放 WAL 会在"WAL 为空时崩溃"退回 0 并撞号）
+- GC 顺序：先 `os.Remove` 成功、再删 `db.readers` 条目
+- `Close` 里 `bgWG.Wait()` 之后要调 `collectGarbageFinal()` 兜底（去掉 closed 检查）
+- `options.go` 的 `L0CompactionTrigger`(4) / `LevelBaseSize`(256MB) / `LevelSizeMultiplier`(10) / `MaxLevels`(7) 已接入
 
 ## 已确立的实现约定
 - 二进制编码（trailer、fixed32/64、WAL 记录头、WriteBatch 头）一律大端
@@ -68,4 +114,4 @@ internal/ 下按模块切分 key / memdb / wal / sst / filter / cache / version 
   根治办法是用 pwsh 7 跑（见上），BOM 只是双保险。
   上述整套环境知识已固化为用户级 skill `~/.workbuddy/skills/win-go-cgo-race/`（含通用版脚本），跨项目可用
 - Go 1.27.1（`C:\Program Files\Go\bin\go.exe`）；删除文件受 safe-delete 沙箱限制，偶尔拒删，可直接把临时文件加进 .gitignore。
-  项目尚未 `git init`（`git status` 会报 not a git repository）
+  仓库已 init（见上"## git"）。
