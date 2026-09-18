@@ -2,6 +2,7 @@ package version
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
@@ -629,5 +630,156 @@ func TestLogAndApplyReleasesOldVersionWithoutDeadlock(t *testing.T) {
 	}
 	if vs.LastSeq() != 50 {
 		t.Errorf("LastSeq() = %d, want 50", vs.LastSeq())
+	}
+}
+
+// ── 导出快照（M5 为 Checkpoint 加的） ──────────────────────────────
+
+// TestSnapshotEditRebuildsVersion 验证 SnapshotEdit 返回的编辑项确实能
+// 完整重建当前版本：层号、区间、文件编号一个都不能少。
+//
+// 它是 Checkpoint 的正确性前提 —— 副本目录里那份 Manifest 就是这个 edit
+// 序列化出来的，漏掉一个文件就等于副本里永久少一段数据。
+func TestSnapshotEditRebuildsVersion(t *testing.T) {
+	dir := t.TempDir()
+	vs := newVS(t, dir)
+	mustApply(t, vs, &VersionEdit{
+		NextFileNum: 10,
+		LastSeq:     77,
+		LogNumber:   5,
+		Added: []FileEdit{
+			fm(1, 100, ik("a", 3), ik("c", 1)).Edit(0),
+			fm(2, 200, ik("d", 9), ik("f", 2)).Edit(0),
+			fm(3, 300, ik("g", 4), ik("m", 1)).Edit(1),
+			fm(4, 400, ik("n", 8), ik("z", 1)).Edit(2),
+		},
+	})
+
+	edit := vs.SnapshotEdit()
+	if edit.ComparatorName != testComparerName {
+		t.Errorf("ComparatorName = %q, want %q", edit.ComparatorName, testComparerName)
+	}
+	if edit.LastSeq != 77 {
+		t.Errorf("LastSeq = %d, want 77", edit.LastSeq)
+	}
+	if edit.LogNumber != 5 {
+		t.Errorf("LogNumber = %d, want 5", edit.LogNumber)
+	}
+	if edit.NextFileNum != vs.NextFileNum() {
+		t.Errorf("NextFileNum = %d, want %d", edit.NextFileNum, vs.NextFileNum())
+	}
+	if len(edit.Deleted) != 0 {
+		t.Errorf("快照不该带任何删除项，实际 %d 条", len(edit.Deleted))
+	}
+
+	// 用一个全新的 VersionSet 应用这份 edit，应当得到一模一样的层布局。
+	other := New(testConfig(t.TempDir()))
+	t.Cleanup(func() { _ = other.Close() }) // Windows 上句柄没关就删不掉临时目录
+	other.SetFromScan(nil, 0)
+	if err := other.LogAndApply(&VersionEdit{NextFileNum: 1}); err != nil {
+		// 没有 Manifest 时 LogAndApply 会返回 ErrNotOpen，这是预期的守卫。
+		if !errors.Is(err, ErrNotOpen) {
+			t.Fatalf("LogAndApply: %v", err)
+		}
+	}
+	if err := other.LogAndApply(edit); !errors.Is(err, ErrNotOpen) {
+		t.Fatalf("没有 Manifest 时应当报 ErrNotOpen，实际 %v", err)
+	}
+	if err := other.NewManifest(); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.LogAndApply(edit); err != nil {
+		t.Fatalf("LogAndApply(snapshot): %v", err)
+	}
+	cur := vs.Current()
+	defer cur.Unref()
+	got := other.Current()
+	defer got.Unref()
+
+	for level := 0; level < cur.NumLevels(); level++ {
+		want := numsOf(cur.Files(level))
+		if !reflect.DeepEqual(numsOf(got.Files(level)), want) {
+			t.Errorf("L%d 的文件不一致：got %v want %v", level, numsOf(got.Files(level)), want)
+		}
+	}
+	if other.LastSeq() != 77 || other.LogNumber() != 5 {
+		t.Errorf("计数没有跟着快照走：LastSeq=%d LogNumber=%d", other.LastSeq(), other.LogNumber())
+	}
+}
+
+// TestWriteManifestProducesRecoverableDirectory 验证 WriteManifest 写出的
+// "Manifest + CURRENT"能被正常恢复。
+//
+// 这是 Checkpoint 的另一半：副本目录里没有本目录的 Manifest 可抄
+// （那份文件正在被追加），只能自己写一份。
+func TestWriteManifestProducesRecoverableDirectory(t *testing.T) {
+	src := t.TempDir()
+	vs := newVS(t, src)
+	mustApply(t, vs, &VersionEdit{
+		NextFileNum: 20,
+		LastSeq:     123,
+		LogNumber:   7,
+		Added: []FileEdit{
+			fm(11, 1, ik("a", 1), ik("b", 1)).Edit(0),
+			fm(12, 1, ik("c", 1), ik("d", 1)).Edit(1),
+		},
+	})
+
+	edit := vs.SnapshotEdit()
+	dst := t.TempDir()
+	const manifestNum = 99
+	if err := WriteManifest(dst, manifestNum, edit); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	// CURRENT 必须指向那份 Manifest，而且是"写完再 rename"留下的完整内容。
+	num, err := readCurrent(dst)
+	if err != nil {
+		t.Fatalf("readCurrent: %v", err)
+	}
+	if num != manifestNum {
+		t.Fatalf("CURRENT 指向 %d，want %d", num, manifestNum)
+	}
+
+	recovered := New(Config{Dir: dst, Comparer: testComparer{name: testComparerName}, MaxLevels: 4})
+	hasManifest, truncated, err := recovered.Recover()
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	t.Cleanup(func() { _ = recovered.Close() })
+	if !hasManifest {
+		t.Fatal("应当从 Manifest 恢复，而不是走目录扫描")
+	}
+	if truncated {
+		t.Fatal("这份 Manifest 是完整写出来的，不该被截断")
+	}
+	cur := recovered.Current()
+	defer cur.Unref()
+	if got := numsOf(cur.Files(0)); !reflect.DeepEqual(got, []uint64{11}) {
+		t.Errorf("L0 = %v, want [11]", got)
+	}
+	if got := numsOf(cur.Files(1)); !reflect.DeepEqual(got, []uint64{12}) {
+		t.Errorf("L1 = %v, want [12]", got)
+	}
+}
+
+// TestWriteManifestRejectsMismatchedComparer 验证副本目录里的比较器标识
+// 仍然能被校验出来 —— 它和源目录用的是同一份 VersionEdit。
+func TestWriteManifestRejectsMismatchedComparer(t *testing.T) {
+	vs := newVS(t, t.TempDir())
+	if err := vs.LogAndApply(&VersionEdit{NextFileNum: 5, ComparatorName: testComparerName}); err != nil {
+		t.Fatal(err)
+	}
+	edit := vs.SnapshotEdit()
+
+	dst := t.TempDir()
+	if err := WriteManifest(dst, 41, edit); err != nil {
+		t.Fatal(err)
+	}
+	other := New(Config{Dir: dst, Comparer: testComparer{name: "someone.else"}, MaxLevels: 4})
+	if _, _, err := other.Recover(); err == nil {
+		t.Fatal("比较器不匹配时应当拒绝打开")
+	} else if !strings.Contains(err.Error(), "comparer") {
+		t.Fatalf("错误里应当说明是比较器不匹配，实际 %v", err)
 	}
 }

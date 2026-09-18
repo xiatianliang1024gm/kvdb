@@ -5,11 +5,25 @@ import (
 	"os"
 	"sort"
 
+	"kvdb/internal/compress"
 	"kvdb/internal/iterator"
 	"kvdb/internal/key"
+	"kvdb/internal/rate"
 	"kvdb/internal/sst"
 	"kvdb/internal/version"
 )
+
+// rateChargeChunk 是限流计费的粒度：累计读写多少字节之后向限流器申请一次配额。
+//
+// 为什么不按记录计费：限流器要把并发的申请串行化，粒度过细会让它自己变成瓶颈
+// （一次 Compaction 可能要过几百万条记录）。256KB 是一个折中 —— 在 10MB/s 的
+// 配额下约每 25ms 停顿一次，既平滑到"不会一口气吃掉几百 MB 带宽"，
+// 又粗到"每条记录只加一次整数加法"。
+//
+// 代价是**尾部不足一块的部分不会被计费**：一次只搬 100KB 的 Compaction 完全
+// 不受限。对小 Compaction 来说这无关紧要（它们的绝对带宽本来就低），
+// 而每一次归并结束时会补交剩余额度（见 rateAccount.flush）。
+const rateChargeChunk = 256 << 10
 
 // Env 是执行一次 Compaction 需要的外部能力。
 //
@@ -24,8 +38,22 @@ type Env struct {
 	// BlockSize / BloomBitsPerKey 透传给输出的 SST。
 	BlockSize       int
 	BloomBitsPerKey int
+	// Compression 是输出 SST 的块压缩算法（零值 = 不压缩）。
+	//
+	// 它只影响**输出**：输入文件按各自块尾的类型字节自行解压，
+	// 所以一次 Compaction 完全可以把"未压缩的老文件"搬成"压缩的新文件"，
+	// 顺带完成格式升级。
+	Compression compress.Type
+	// RateLimiter 限制本次 Compaction 的读写带宽；nil 表示不限。
+	//
+	// 它**不挂在读取器上**，而是包在输入迭代器外面：输入文件的 Reader 是全库共享的
+	// （前台的 Get 也会用它），把限流挂在那里会连前台点查一起限掉，
+	// 那就完全违背了"限流的目的是保护前台"这件事。
+	RateLimiter *rate.Limiter
 	// TargetFileSize 是本次输出层单个文件的目标字节数。
 	TargetFileSize uint64
+	// BlockStats 非 nil 时累计输出文件的块压缩规模。
+	BlockStats *sst.BlockStats
 
 	// SmallestSnapshot 是"还可能有读者"的最小序列号：seq <= 它的旧版本可以丢弃。
 	//
@@ -45,6 +73,88 @@ type Env struct {
 	// 调用它时输出文件已经写完并 fsync 过；它返回错误则本次 Compaction 整体作废，
 	// Run 负责把半成品文件删掉。
 	Commit func(c *Compaction, outputs []*version.FileMeta) error
+}
+
+// rateAccount 是一次 Compaction 的带宽账本：输入与输出共用一个限流器，
+// 但各自累计自己的零头，最后统一补交。
+//
+// 用一个结构体而不是两个局部变量，是因为它要同时被"输入迭代器包装"和
+// "输出文件集合"两条路径共享。
+type rateAccount struct {
+	lim *rate.Limiter
+	// pending 是还没申请配额的字节数（不足一个 rateChargeChunk）。
+	input, output int64
+}
+
+// chargeInput 记下输入侧读到的字节。
+func (a *rateAccount) chargeInput(n int64) {
+	if a == nil || a.lim == nil || n <= 0 {
+		return
+	}
+	a.input += n
+	if a.input >= rateChargeChunk {
+		a.lim.Request(int(a.input))
+		a.input = 0
+	}
+}
+
+// chargeOutput 记下输出侧写出的字节。
+func (a *rateAccount) chargeOutput(n int64) {
+	if a == nil || a.lim == nil || n <= 0 {
+		return
+	}
+	a.output += n
+	if a.output >= rateChargeChunk {
+		a.lim.Request(int(a.output))
+		a.output = 0
+	}
+}
+
+// flush 补交两侧的零头。一次 Compaction 结束时调用一次。
+//
+// 不做这一步的话，一次"刚好搬了 200KB"的 Compaction 会完全不受限 ——
+// 零头永远不结算，限流就只在长时间负载下才生效。
+func (a *rateAccount) flush() {
+	if a == nil || a.lim == nil {
+		return
+	}
+	if total := a.input + a.output; total > 0 {
+		a.lim.Request(int(total))
+		a.input, a.output = 0, 0
+	}
+}
+
+// throttledIterator 给一个输入迭代器套上限流：每读出一条记录就记一次账。
+//
+// 计费在"移动之后"发生，于是每条记录恰好被计一次（SeekToFirst 计第一条，
+// 之后每次 Next 计新到位的那一条）。记账本身只是一次整数加法，
+// 真正会阻塞的申请被攒到 256KB 才发生一次。
+type throttledIterator struct {
+	iterator.Iterator
+	account *rateAccount
+}
+
+func (t *throttledIterator) SeekToFirst() {
+	t.Iterator.SeekToFirst()
+	t.charge()
+}
+
+func (t *throttledIterator) Seek(target []byte) {
+	t.Iterator.Seek(target)
+	t.charge()
+}
+
+func (t *throttledIterator) Next() {
+	t.Iterator.Next()
+	t.charge()
+}
+
+// charge 把当前记录的 key + value 长度记进账本。
+func (t *throttledIterator) charge() {
+	if t.account == nil || t.account.lim == nil || !t.Iterator.Valid() {
+		return
+	}
+	t.account.chargeInput(int64(len(t.Iterator.Key()) + len(t.Iterator.Value())))
 }
 
 // Result 汇报一次 Compaction 的规模，是读写放大统计的数据来源。
@@ -69,13 +179,17 @@ type Result struct {
 func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 	res := Result{InputFiles: len(c.Inputs[0]) + len(c.Inputs[1]), InputBytes: c.InputBytes()}
 
-	children, err := inputIterators(c, env)
+	// 带宽账本：输入与输出共用一份限流器的配额，收尾时补交零头。
+	account := &rateAccount{lim: env.RateLimiter}
+	defer account.flush()
+
+	children, err := inputIterators(c, env, account)
 	if err != nil {
 		return res, err
 	}
 	mi := iterator.NewMerging(env.ICmp, children...)
 
-	out := &outputSet{env: env, level: c.OutputLevel}
+	out := &outputSet{env: env, level: c.OutputLevel, account: account}
 	committed := false
 	defer func() {
 		if !committed {
@@ -143,7 +257,9 @@ func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 // 顺序不是随便定的：归并迭代器在两条记录的 internal key 完全相同时，按下标小的先输出。
 // 同层同 key 的不同版本 seq 不同、internal key 也就不同，所以这个决胜规则只在
 // "不同层出现同一个 internal key"时起作用 —— 那正是必须让新文件排在前面的时候。
-func inputIterators(c *Compaction, env Env) ([]iterator.Iterator, error) {
+//
+// account 非 nil 时，每个子迭代器外面会套一层限流计费。
+func inputIterators(c *Compaction, env Env, account *rateAccount) ([]iterator.Iterator, error) {
 	first := append([]*version.FileMeta(nil), c.Inputs[0]...)
 	if c.Level == 0 {
 		// L0：区间互相重叠，必须严格"编号大（新）在前"。
@@ -162,7 +278,11 @@ func inputIterators(c *Compaction, env Env) ([]iterator.Iterator, error) {
 			if err != nil {
 				return nil, fmt.Errorf("kvdb/compact: open input file %d: %w", f.Num, err)
 			}
-			out = append(out, r.NewIterator())
+			var it iterator.Iterator = r.NewIterator()
+			if account != nil && account.lim != nil {
+				it = &throttledIterator{Iterator: it, account: account}
+			}
+			out = append(out, it)
 		}
 	}
 	return out, nil
@@ -170,8 +290,9 @@ func inputIterators(c *Compaction, env Env) ([]iterator.Iterator, error) {
 
 // outputSet 管理本次 Compaction 的输出文件：按目标大小切分、记录每个文件的 key 区间。
 type outputSet struct {
-	env   Env
-	level int
+	env     Env
+	level   int
+	account *rateAccount
 
 	w     *sst.Writer
 	num   uint64
@@ -207,6 +328,7 @@ func (o *outputSet) add(ik, value []byte) error {
 	if err := o.w.Add(ik, value); err != nil {
 		return err
 	}
+	o.account.chargeOutput(int64(len(ik) + len(value)))
 	if o.first == nil {
 		o.first = append([]byte(nil), ik...)
 	}
@@ -230,6 +352,8 @@ func (o *outputSet) create() error {
 	w, err := sst.NewWriter(path, o.env.ICmp.User, sst.WriterOptions{
 		BlockSize:       o.env.BlockSize,
 		BloomBitsPerKey: o.env.BloomBitsPerKey,
+		Compression:     o.env.Compression,
+		BlockStats:      o.env.BlockStats,
 	})
 	if err != nil {
 		return err

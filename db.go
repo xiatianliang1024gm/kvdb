@@ -11,6 +11,7 @@ import (
 	"kvdb/internal/cache"
 	"kvdb/internal/key"
 	"kvdb/internal/memdb"
+	"kvdb/internal/rate"
 	"kvdb/internal/sst"
 	"kvdb/internal/version"
 	"kvdb/internal/wal"
@@ -105,6 +106,17 @@ type DB struct {
 	snapshots map[uint64]int
 
 	report RecoveryReport
+
+	// blockStats 累计块压缩在读写两侧的规模，Flush / Compaction 的 Writer 与
+	// 全部 Reader 共享同一份（内部是原子量，无需加锁）。
+	blockStats *sst.BlockStats
+	// rateLimiter 限制后台 Compaction 的读写带宽；不限流时为 nil（nil 是合法的空操作）。
+	rateLimiter *rate.Limiter
+	// eventLog 接收运维事件。Open 一定把它填好：要么是用户给的 Logger，
+	// 要么是数据目录下的文件日志，要么是丢弃型的空实现（禁用文件日志时）。
+	eventLog Logger
+	// closeEventLog 关闭事件日志（用户提供的 Logger 不会被关）。
+	closeEventLog func() error
 
 	// counters 是全引擎的累计指标。用原子量而不是锁保护：读路径上的每一个计数器
 	// 都值得避免再加一次锁竞争，而 Stats 读到的值本来就是近似快照。
@@ -238,6 +250,39 @@ type Stats struct {
 	// 保留它还需要读的那些版本。这个数长期不归零，说明有快照忘了 Release ——
 	// 不会读错数据，但旧版本会一直留在磁盘上。
 	LiveSnapshots int
+
+	// ── M5：块压缩与限流 ────────────────────────────────────────────
+	//
+	// Compression 把"写出去多少、省下来多少"变成可验证的数字：
+	// 压缩比 = RawBytes / StoredBytes，没有压缩时两项相等。
+	Compression CompressionStats
+	// RateLimit 是后台 Compaction 限流器的累计状态；不限流时 Waits 恒为 0。
+	RateLimit RateLimitStats
+}
+
+// CompressionStats 汇总块压缩在读写两侧的累计规模。
+type CompressionStats struct {
+	// BlocksWritten 是写出的块总数，CompressedBlocks 是其中真正压缩落盘的数量。
+	// 两者的差值是"压了不划算"的块（过滤器位图、小索引块、高熵数据）。
+	BlocksWritten    int64
+	CompressedBlocks int64
+	// RawBytes 是写出块的原始字节总数，StoredBytes 是实际落盘字节总数。
+	// 压缩比 = RawBytes / StoredBytes（StoredBytes 为 0 时未写过块）。
+	RawBytes    uint64
+	StoredBytes uint64
+	// Decompressions 是读取时实际解压的次数；CompressedBytesRead 是解压前读入的字节数。
+	// 它与块缓存命中率是一对：命中率越高，这个数越低。
+	Decompressions      int64
+	CompressedBytesRead uint64
+}
+
+// RateLimitStats 是限流器的累计状态。
+type RateLimitStats struct {
+	// Bytes 是累计放行的字节数；Waits 是实际阻塞的次数，WaitNanos 是累计阻塞时长。
+	// Waits 为 0 说明 Compaction 的带宽从未打满配额。
+	Bytes     uint64
+	Waits     int64
+	WaitNanos int64
 }
 
 // LevelStats 是单层的规模。
@@ -304,6 +349,20 @@ func (db *DB) Stats() Stats {
 	cs := db.blockCache.Stats()
 	s.CacheHits, s.CacheMisses = cs.Hits, cs.Misses
 	s.CacheBytes, s.CacheItems = cs.Bytes, cs.Count
+
+	if snap := db.blockStats.Snapshot(); snap.Blocks > 0 || snap.Decompressions > 0 {
+		s.Compression = CompressionStats{
+			BlocksWritten:       snap.Blocks,
+			CompressedBlocks:    snap.Compressed,
+			RawBytes:            snap.RawBytes,
+			StoredBytes:         snap.StoredBytes,
+			Decompressions:      snap.Decompressions,
+			CompressedBytesRead: snap.CompressedRead,
+		}
+	}
+	if st := db.rateLimiter.Stats(); st.Bytes > 0 || st.Waits > 0 {
+		s.RateLimit = RateLimitStats{Bytes: st.Bytes, Waits: st.Waits, WaitNanos: st.WaitNanos}
+	}
 	return s
 }
 
@@ -324,17 +383,22 @@ func Open(opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		opts:      opts,
-		cmp:       opts.Comparer,
-		icmp:      opts.internalKeyComparer(),
-		lock:      lock,
-		vset:      version.New(version.Config{Dir: opts.Dir, Comparer: opts.Comparer, MaxLevels: opts.MaxLevels}),
-		readers:   make(map[uint64]*sst.Reader),
-		snapshots: make(map[uint64]int),
-		flushCh:   make(chan struct{}, 1),
-		compactCh: make(chan struct{}, 1),
-		closeCh:   make(chan struct{}),
+		opts:        opts,
+		cmp:         opts.Comparer,
+		icmp:        opts.internalKeyComparer(),
+		lock:        lock,
+		vset:        version.New(version.Config{Dir: opts.Dir, Comparer: opts.Comparer, MaxLevels: opts.MaxLevels}),
+		readers:     make(map[uint64]*sst.Reader),
+		snapshots:   make(map[uint64]int),
+		blockStats:  &sst.BlockStats{},
+		rateLimiter: rate.New(opts.CompactionRateLimit),
+		flushCh:     make(chan struct{}, 1),
+		compactCh:   make(chan struct{}, 1),
+		closeCh:     make(chan struct{}),
 	}
+	eventLog, closeEventLog, logErr := setupEventLog(&opts)
+	db.eventLog = eventLog
+	db.closeEventLog = closeEventLog
 	// BlockCacheSize > 0 才建缓存；显式关闭（归一化后为 0）时保持 nil，
 	// 读路径会自动退化成"每读一块分配一次"。
 	db.blockCache = cache.New(opts.BlockCacheSize)
@@ -344,7 +408,31 @@ func Open(opts Options) (*DB, error) {
 
 	if err := db.recover(); err != nil {
 		db.releaseLock()
+		closeEventLog()
 		return nil, err
+	}
+
+	// 事件日志在这里才用得上：恢复过程中发生的丢弃/截断马上就要写进 LOG。
+	if logErr != nil {
+		db.logWarnf("falling back to no-op event log: %v", logErr)
+	}
+	db.logInfof("open db: dir=%s compression=%s rate_limit=%d memtable=%dMB block_cache=%dMB bloom=%db/key sync_writes=%v",
+		opts.Dir, opts.Compression, opts.CompactionRateLimit, opts.MemTableSize>>20,
+		opts.BlockCacheSize>>20, opts.BloomBitsPerKey, opts.SyncWrites)
+	if db.report.TruncatedManifest {
+		db.logWarnf("manifest tail was truncated during recovery")
+	}
+	for _, name := range db.report.DiscardedFiles {
+		db.logWarnf("discarded corrupt file %s (its data is still in the WAL)", name)
+	}
+	for _, name := range db.report.ObsoleteFiles {
+		db.logInfof("removed unreferenced complete file %s", name)
+	}
+	if db.report.RecoveredFromScan {
+		db.logWarnf("no manifest found: file list rebuilt from directory scan")
+	}
+	if db.rateLimiter != nil {
+		db.logInfof("compaction rate limit enabled: %d bytes/sec", opts.CompactionRateLimit)
 	}
 
 	db.bgWG.Add(2)
@@ -384,6 +472,18 @@ func (db *DB) Close() error {
 	// 还没来得及回收被它消耗掉的输入文件。这一步补上，目录里才不会留下孤儿。
 	db.collectGarbageFinal()
 
+	// 限流器在这一刻已经没有任务在等了（后台协程都已退出），Close 只是防御性的。
+	db.rateLimiter.Close()
+
+	// 汇总一次关库前的规模。放在这里：最后一段清理不改变这些累计量，
+	// 而 logInfof 只碰 eventLog 字段，不需要 db.mu。
+	db.mu.RLock()
+	lastSeq, fileCount := db.lastSeq, db.v.FileCount()
+	db.mu.RUnlock()
+	snap := db.blockStats.Snapshot()
+	db.logInfof("close db: files=%d last_seq=%d blocks=%d compressed=%d raw=%d stored=%d decompressions=%d",
+		fileCount, lastSeq, snap.Blocks, snap.Compressed, snap.RawBytes, snap.StoredBytes, snap.Decompressions)
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -410,6 +510,12 @@ func (db *DB) Close() error {
 		errs = append(errs, err)
 	}
 	if err := db.releaseLock(); err != nil {
+		errs = append(errs, err)
+	}
+	// 用户提供的 Logger 不归我们关；closeEventLog 对那种情形是空操作。
+	// 置成丢弃实现是为了防"Close 之后还有 goroutine 迟到地调日志"。
+	db.eventLog = nopLogger{}
+	if err := db.closeEventLog(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -562,9 +668,10 @@ func (db *DB) readerFor(num uint64) (*sst.Reader, error) {
 // openReader 打开一个 SST 的读取器。它不碰任何共享状态，因此可以在锁外调用。
 func (db *DB) openReader(num uint64) (*sst.Reader, error) {
 	return sst.Open(sst.FilePath(db.opts.Dir, num), sst.OpenOptions{
-		Comparer: db.cmp,
-		Cache:    db.blockCache,
-		FileNum:  num,
+		Comparer:   db.cmp,
+		Cache:      db.blockCache,
+		FileNum:    num,
+		BlockStats: db.blockStats,
 	})
 }
 

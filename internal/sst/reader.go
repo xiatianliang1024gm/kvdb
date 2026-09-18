@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"kvdb/internal/cache"
+	"kvdb/internal/compress"
 	"kvdb/internal/crc"
 	"kvdb/internal/filter"
 	"kvdb/internal/key"
@@ -23,6 +24,12 @@ type OpenOptions struct {
 	// 文件编号在本引擎里单调递增且永不复用，所以 (编号, 块偏移) 能唯一标识一块内容，
 	// 缓存条目不需要引用计数，也不需要担心"文件被删了但缓存里还有旧数据"。
 	FileNum uint64
+	// BlockStats 非 nil 时累计解压次数；多个 Reader 可以共享同一份计数。
+	//
+	// 这里**没有**"压缩开关"：读路径永远按块尾的类型字节路由到对应算法，
+	// 与打开时的配置无关。否则"把 Compression 改成 none 再打开老目录"就会让
+	// 所有压缩块变成不可读 —— 配置项的改动不该能损坏既有数据。
+	BlockStats *BlockStats
 }
 
 // Reader 读取一个 SSTable。
@@ -38,6 +45,7 @@ type Reader struct {
 	fileNum uint64
 	cache   *cache.Cache
 	icmp    key.InternalComparer
+	blocks  *BlockStats
 
 	index     []byte
 	numBlocks int
@@ -85,6 +93,7 @@ func Open(path string, o OpenOptions) (*Reader, error) {
 		fileNum: o.FileNum,
 		cache:   o.Cache,
 		icmp:    key.InternalComparer{User: o.Comparer},
+		blocks:  o.BlockStats,
 	}
 	fail := func(err error) (*Reader, error) {
 		f.Close()
@@ -245,7 +254,19 @@ func (r *Reader) checkHandle(h blockHandle) error {
 	return nil
 }
 
-// readBlock 读入一个块并校验 CRC。命中缓存时直接返回缓存里的字节。
+// readBlock 读入一个块，校验 CRC，必要时解压。命中缓存时直接返回缓存里的字节。
+//
+// 三步的顺序不能换：
+//
+//  1. **先校验 CRC**，而且校验的是从磁盘读回来的那份字节（压缩形态）。
+//     CRC 过了才说明"这串字节确实是我写进去的"，此时再解压就不会把损坏的
+//     位流喂给解压器 —— 那既可能报出误导性的错误，也可能放大成一次巨额内存分配。
+//  2. **再解压**（未压缩块直接跳过）。
+//  3. **缓存解压后的内容**。这一点很关键：缓存里存压缩流的话，每一次命中
+//     都要重新解压一遍，块缓存就只省下了磁盘 IO、省不掉 CPU。存解压后的字节，
+//     命中即可以直接用。
+//
+// 代价是缓存按解压后的大小计费 —— 这是对的，因为内存占用本来就是按解压后的算。
 func (r *Reader) readBlock(h blockHandle) ([]byte, error) {
 	if b, ok := r.cache.Get(r.fileNum, h.offset); ok {
 		return b, nil
@@ -259,14 +280,30 @@ func (r *Reader) readBlock(h blockHandle) ([]byte, error) {
 		return nil, fmt.Errorf("kvdb/sst: read block at %d of %s: %w", h.offset, r.path, err)
 	}
 	trailer := buf[h.size:]
-	if trailer[0] != blockCompressionNone {
-		return nil, fmt.Errorf("%w: %s: unsupported block compression type %d", ErrCorruptBlock, r.path, trailer[0])
-	}
+	ctype := compress.Type(trailer[0])
 	if want := binary.BigEndian.Uint32(trailer[1:]); crc.ChecksumWithType(buf[:h.size], trailer[0]) != want {
 		return nil, fmt.Errorf("%w: %s: block at offset %d failed the checksum", ErrCorruptBlock, r.path, h.offset)
 	}
 
 	data := buf[:h.size]
+	if ctype != compress.Type(blockCompressionNone) {
+		c, err := compress.ByType(ctype)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: block at offset %d: %v", ErrUnsupportedCompression, r.path, h.offset, err)
+		}
+		out, err := c.Decompress(nil, data)
+		if err != nil {
+			// 到这里说明块的 CRC 是对的、但内容不是合法的压缩流。
+			// 归到 ErrCorruptBlock：对上层来说它与"块坏了"是同一件事。
+			return nil, fmt.Errorf("%w: %s: block at offset %d: %v", ErrCorruptBlock, r.path, h.offset, err)
+		}
+		data = out
+		if r.blocks != nil {
+			r.blocks.Decompressions.Add(1)
+			r.blocks.CompressedBytesRead.Add(uint64(h.size))
+		}
+	}
+
 	r.cache.Put(r.fileNum, h.offset, data)
 	return data, nil
 }

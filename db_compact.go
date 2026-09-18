@@ -65,6 +65,8 @@ func (db *DB) runCompactions() error {
 			ICmp:             db.icmp,
 			BlockSize:        db.opts.BlockSize,
 			BloomBitsPerKey:  db.opts.BloomBitsPerKey,
+			Compression:      db.opts.Compression.toType(),
+			RateLimiter:      db.rateLimiter,
 			TargetFileSize:   db.opts.targetFileSize(c.OutputLevel),
 			SmallestSnapshot: snapshot,
 			AllocFileNum:     db.vset.AllocFileNum,
@@ -76,10 +78,13 @@ func (db *DB) runCompactions() error {
 			if errors.Is(err, errClosing) {
 				return err
 			}
+			db.logErrorf("compaction failed: %s: %v", c, err)
 			return fmt.Errorf("kvdb: compaction (%s): %w", c, err)
 		}
 
 		db.recordCompaction(res)
+		db.logInfof("compaction done: %s inputs=%d(%s) outputs=%d(%s) dropped=%d",
+			c, res.InputFiles, humanBytes(res.InputBytes), res.OutputFiles, humanBytes(res.OutputBytes), res.DroppedRecords)
 		db.collectGarbage()
 	}
 }

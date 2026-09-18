@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 
+	"kvdb/internal/compress"
 	"kvdb/internal/key"
+	"kvdb/internal/logger"
 )
 
 // 默认配置，数值取自 docs/DESIGN.md 附录 A 的 Options 草图。
@@ -26,7 +28,90 @@ const (
 	DefaultLevelSizeMultiplier = 10
 	// DefaultMaxLevels 是默认的最大层数（含 L0）。
 	DefaultMaxLevels = 7
+	// DefaultLogMaxSize 是数据目录下 LOG 文件的默认轮转阈值。
+	DefaultLogMaxSize = 1 << 20 // 1MB
 )
+
+// Compression 选择 SSTable 数据块的压缩算法。
+//
+// 数值沿用本引擎"0 = 默认值"的约定：零值 CompressionDefault 表示启用默认算法
+// （Snappy），负数 CompressionNone 表示显式关闭。
+type Compression int8
+
+const (
+	// CompressionDefault 是零值：采用默认算法（Snappy）。
+	CompressionDefault Compression = 0
+	// CompressionNone 显式关闭块压缩。
+	CompressionNone Compression = -1
+	// CompressionSnappy 是 Snappy（default），解压速度优先。
+	CompressionSnappy Compression = 1
+	// CompressionZlib 是 stdlib flate（BestSpeed），压缩率更高、CPU 更贵。
+	CompressionZlib Compression = 2
+)
+
+// String 返回算法名，用于日志与压测报告。
+func (c Compression) String() string {
+	switch c {
+	case CompressionNone:
+		return "none"
+	case CompressionSnappy, CompressionDefault:
+		return "snappy"
+	case CompressionZlib:
+		return "zlib"
+	default:
+		return fmt.Sprintf("unknown(%d)", int8(c))
+	}
+}
+
+// toType 映射到 internal/compress 的类型字节。ensureDefaults 之后的值一定落在已知项里。
+func (c Compression) toType() compress.Type {
+	switch c {
+	case CompressionNone:
+		return compress.TypeNone
+	case CompressionZlib:
+		return compress.TypeZlib
+	default:
+		return compress.TypeSnappy
+	}
+}
+
+// Logger 接收引擎的事件日志（打开、Flush、Compaction、故障……）。
+//
+// 为 nil 时引擎把事件写进数据目录下的 LOG 文件（按大小轮转到 LOG.old）。
+// 想把日志接进自己的体系就实现这个接口传进来；要复用 internal 包自带的
+// 文件实现，用 NewFileLogger 构造即可。
+type Logger interface {
+	// Infof 记录正常运维事件。
+	Infof(format string, args ...any)
+	// Warnf 记录"能继续跑，但需要人看一眼"的事件。
+	Warnf(format string, args ...any)
+	// Errorf 记录故障。
+	Errorf(format string, args ...any)
+}
+
+// fileLogger 把根包的 Logger 接口适配到 internal/logger 的文件实现。
+// 做成独立类型而不是让 *logger.Logger 直接实现，是为了不让根包的接口
+// 暴露 internal 包的具体方法集。
+type fileLogger struct{ l *logger.Logger }
+
+func (f fileLogger) Infof(format string, args ...any)  { f.l.Logf(logger.LevelInfo, format, args...) }
+func (f fileLogger) Warnf(format string, args ...any)  { f.l.Logf(logger.LevelWarning, format, args...) }
+func (f fileLogger) Errorf(format string, args ...any) { f.l.Logf(logger.LevelError, format, args...) }
+
+// NewFileLogger 创建一个写到 dir 目录下 LOG 文件的 Logger，超过 maxSize 字节
+// 轮转为 LOG.old。maxSize <= 0 时用 DefaultLogMaxSize。
+//
+// 数据库打开期间会持有这个实例；用完（关闭数据库之后）记得调用返回值的 Close。
+func NewFileLogger(dir string, maxSize int) (Logger, func() error, error) {
+	if maxSize <= 0 {
+		maxSize = DefaultLogMaxSize
+	}
+	l, err := logger.NewFile(dir, logger.DefaultName, maxSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fileLogger{l}, l.Close, nil
+}
 
 // Comparer 定义 user key 之间的全序关系，允许替换以支持自定义 key 编码（如倒序时间戳）。
 //
@@ -92,6 +177,29 @@ type Options struct {
 	// 置为 false 则返回更快，但进程崩溃可能丢掉最近若干条写——
 	// 只适合可重建的缓存类数据。
 	SyncWrites bool
+
+	// Compression 选择 SSTable 数据块的块级压缩算法。
+	//
+	// 压缩发生在"一个 Data Block 写满"的时刻：压完若省不下 1/8 就原样存储。
+	// 读侧在块缓存未命中时解压一次。默认 Snappy。
+	Compression Compression
+
+	// CompactionRateLimit 是后台 Compaction 的读写带宽上限，单位字节/秒。
+	//
+	// 0 = 不限流。Compaction 与前台读写共享磁盘，磁盘抖动最明显的症状是
+	// 点查长尾突然变高 —— 给它限一个配额，就是把长尾换成交付时间。
+	CompactionRateLimit int
+
+	// LogMaxSize 是数据目录下 LOG 文件的轮转阈值，单位字节。
+	//
+	// 0 = 用 DefaultLogMaxSize（1MB）；负数 = 不写文件日志（Logger 为 nil 时
+	// 引擎也没有任何事件输出）。事件本身始终可通过 Options.Logger 接走。
+	LogMaxSize int
+
+	// Logger 接收引擎的事件日志；nil 时写入数据目录下的 LOG 文件。
+	//
+	// 注意：引擎不会关闭用户提供的 Logger，Close 时只关闭自己创建的文件日志。
+	Logger Logger
 }
 
 // DefaultOptions 返回字段全部填好的默认配置。
@@ -108,6 +216,7 @@ func DefaultOptions(dir string) Options {
 		LevelSizeMultiplier: DefaultLevelSizeMultiplier,
 		MaxLevels:           DefaultMaxLevels,
 		SyncWrites:          true,
+		Compression:         CompressionDefault,
 	}
 }
 
@@ -149,6 +258,11 @@ func (o *Options) ensureDefaults() {
 	if o.MaxLevels <= 0 {
 		o.MaxLevels = DefaultMaxLevels
 	}
+	// Compression 的零值是"默认算法"而不是"不压缩"，与数值字段不同：
+	// 想明确关掉必须写 CompressionNone。这不破坏约定 —— 0 仍然等于"给最常见的默认"。
+	if o.Compression == CompressionDefault {
+		o.Compression = CompressionSnappy
+	}
 }
 
 // Validate 校验配置是否自洽。
@@ -180,6 +294,13 @@ func (o *Options) Validate() error {
 	}
 	if o.MaxLevels < 2 {
 		return fmt.Errorf("kvdb: Options.MaxLevels must be at least 2, got %d", o.MaxLevels)
+	}
+	// 零值 CompressionDefault 是合法输入（表示"用默认算法"），ensureDefaults
+	// 会把它归一成 Snappy；走到这里还是未知值才是调用方传错了。
+	switch o.Compression {
+	case CompressionDefault, CompressionNone, CompressionSnappy, CompressionZlib:
+	default:
+		return fmt.Errorf("kvdb: unknown Options.Compression %d", int8(o.Compression))
 	}
 	return nil
 }

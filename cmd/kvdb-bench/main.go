@@ -24,7 +24,11 @@
 //	go run ./cmd/kvdb-bench -mode sweep -n 200000 -files 1,4,16,64
 //	go run ./cmd/kvdb-bench -mode group -writes 2000 -writers 1,2,4,8,16,32
 //
-// YCSB 式负载与各层放大系数留到 M5。
+//	ycsb        YCSB 式负载（workload A~F、Zipfian 分布、per-op 延迟分位）
+//	compress    none / snappy / zlib 三种块压缩的磁盘占用与读写开销对照
+//	checkpoint  一致性副本的生成、打开、隔离性验证
+//
+// 三个新模式都受 -compression / -rate-limit 影响，头部会打印当前配置。
 package main
 
 import (
@@ -51,12 +55,15 @@ func main() {
 
 // 运行模式。
 const (
-	modeAll   = "all"   // 写入 + 点查 + 范围扫描
-	modeWrite = "write" // 只写（M1 的行为）
-	modePoint = "point" // 只做点查
-	modeScan  = "scan"  // 只做范围扫描
-	modeSweep = "sweep" // 按文件数扫描（每次重建数据集）
-	modeGroup = "group" // 按并发写者数扫描（组提交）
+	modeAll       = "all"        // 写入 + 点查 + 范围扫描
+	modeWrite     = "write"      // 只写（M1 的行为）
+	modePoint     = "point"      // 只做点查
+	modeScan      = "scan"       // 只做范围扫描
+	modeSweep     = "sweep"      // 按文件数扫描（每次重建数据集）
+	modeGroup     = "group"      // 按并发写者数扫描（组提交）
+	modeYCSB      = "ycsb"       // YCSB 式负载（M5）
+	modeCompress  = "compress"   // 压缩算法对照（M5）
+	modeCheckpoin = "checkpoint" // 一致性副本（M5）
 )
 
 type config struct {
@@ -84,6 +91,17 @@ type config struct {
 	writes     int
 	writerList []int
 	groupSync  bool
+
+	// ── M5：ycsb / compress / checkpoint ──
+	workload    string
+	ops         int
+	zipf        bool
+	compression string // 原始旗标值（打印用）
+	comp        kvdb.Compression
+	rateLimit   int
+	report      string
+	l0Trigger   int
+	levelBase   int
 }
 
 func run() error {
@@ -99,7 +117,7 @@ func run() error {
 		verify      = flag.Bool("verify", true, "写完之后把所有 key 读一遍并校验")
 		keepDir     = flag.Bool("keep", false, "保留数据目录（配合 -dir 使用）")
 		printSample = flag.Int("sample", 5, "打印多少个 key 作为抽样")
-		mode        = flag.String("mode", modeAll, "运行模式：all | write | point | scan | sweep")
+		mode        = flag.String("mode", modeAll, "运行模式：all | write | point | scan | sweep | group | ycsb | compress | checkpoint")
 		lookups     = flag.Int("lookups", 0, "点查次数；0 表示与 -n 相同")
 		missRatio   = flag.Float64("miss-ratio", 0.1, "点查中不存在的 key 所占比例（走 Bloom Filter）")
 		scanLen     = flag.Int("scan-len", 100, "每次范围扫描覆盖的 key 数")
@@ -111,6 +129,15 @@ func run() error {
 		writes     = flag.Int("writes", 2000, "group 模式下每档的总写入次数")
 		writerList = flag.String("writers", "1,2,4,8,16,32", "group 模式下要测试的并发写者数列表")
 		groupSync  = flag.Bool("group-sync", true, "group 模式下是否每条写都 fsync（组提交只有开着它才有意义）")
+
+		workload    = flag.String("workload", "A", "ycsb 模式的负载：A|B|C|D|E|F")
+		ops         = flag.Int("ops", 100000, "ycsb 模式 run 阶段的操作数")
+		zipf        = flag.Bool("zipf", true, "ycsb 模式使用 Zipfian 请求分布（false = 均匀分布）")
+		compression = flag.String("compression", "snappy", "块压缩算法：none|snappy|zlib")
+		rateLimit   = flag.Int("rate-limit", 0, "后台 Compaction 带宽上限（字节/秒）；0 表示不限流")
+		l0Trigger   = flag.Int("l0-trigger", 0, "L0 触发 Compaction 的文件数；0 表示用默认值")
+		levelBase   = flag.Int("level-base-size", 0, "L1 容量上限（字节）；0 表示用默认值")
+		report      = flag.String("report", "", "把本次运行的 markdown 摘要追加到该文件（配合 ycsb/compress/checkpoint 模式）")
 	)
 	flag.Parse()
 
@@ -137,6 +164,15 @@ func run() error {
 
 		writes:    *writes,
 		groupSync: *groupSync,
+
+		workload:    *workload,
+		ops:         *ops,
+		zipf:        *zipf,
+		compression: *compression,
+		rateLimit:   *rateLimit,
+		report:      *report,
+		l0Trigger:   *l0Trigger,
+		levelBase:   *levelBase,
 	}
 	if cfg.lookups <= 0 {
 		cfg.lookups = cfg.numKeys
@@ -158,6 +194,11 @@ func run() error {
 	if cfg.numKeys <= 0 {
 		return errors.New("-n must be positive")
 	}
+	comp, err := parseCompression(cfg.compression)
+	if err != nil {
+		return err
+	}
+	cfg.comp = comp
 
 	switch cfg.mode {
 	case modeSweep:
@@ -172,10 +213,33 @@ func run() error {
 			return err
 		}
 		return runGroup(cfg, ws)
+	case modeYCSB:
+		if cfg.ops <= 0 {
+			return errors.New("-ops must be positive")
+		}
+		return runYCSB(cfg)
+	case modeCompress:
+		return runCompress(cfg)
+	case modeCheckpoin:
+		return runCheckpointBench(cfg)
 	case modeAll, modeWrite, modePoint, modeScan:
 		return runOnce(cfg)
 	default:
-		return fmt.Errorf("unknown -mode %q (want all|write|point|scan|sweep|group)", cfg.mode)
+		return fmt.Errorf("unknown -mode %q (want all|write|point|scan|sweep|group|ycsb|compress|checkpoint)", cfg.mode)
+	}
+}
+
+// parseCompression 解析 -compression 的取值。
+func parseCompression(s string) (kvdb.Compression, error) {
+	switch s {
+	case "none", "off":
+		return kvdb.CompressionNone, nil
+	case "snappy":
+		return kvdb.CompressionSnappy, nil
+	case "zlib", "flate":
+		return kvdb.CompressionZlib, nil
+	default:
+		return 0, fmt.Errorf("unknown -compression %q (want none|snappy|zlib)", s)
 	}
 }
 
@@ -804,6 +868,12 @@ func printHeader(cfg config, dir string, db *kvdb.DB) {
 		fmt.Printf("  bloom filter     disabled\n")
 	}
 	fmt.Printf("  sync writes      %v\n", opts.SyncWrites)
+	fmt.Printf("  compression      %s\n", opts.Compression)
+	if opts.CompactionRateLimit > 0 {
+		fmt.Printf("  rate limit       %d bytes/sec\n", opts.CompactionRateLimit)
+	} else {
+		fmt.Printf("  rate limit       unlimited\n")
+	}
 	// 分层的两个参数决定了"什么时候搬、搬到哪一层"，是解读下面 level 分布的前提。
 	fmt.Printf("  l0 trigger       %d files\n", opts.L0CompactionTrigger)
 	fmt.Printf("  level sizing     L1 %s x %d, max levels %d\n",
@@ -949,6 +1019,10 @@ func buildOptions(cfg config, dir string) kvdb.Options {
 	if cfg.bloomBits != 0 {
 		opts.BloomBitsPerKey = cfg.bloomBits
 	}
+	opts.Compression = cfg.comp
+	if cfg.rateLimit > 0 {
+		opts.CompactionRateLimit = cfg.rateLimit
+	}
 	return opts
 }
 
@@ -1016,4 +1090,24 @@ func parseFileList(s string) ([]int, error) {
 		return nil, errors.New("-files must list at least one file count")
 	}
 	return out, nil
+}
+
+// ── 报告输出 ──────────────────────────────────────────────────────
+
+// appendReport 把一段 markdown 追加到 cfg.report 指定的文件；文件不存在时
+// 先写报告头。报告只记录事实（配置 + 数字），结论留给阅读的人。
+func appendReport(cfg config, title, body string) error {
+	if cfg.report == "" {
+		return nil
+	}
+	f, err := os.OpenFile(cfg.report, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	info, _ := f.Stat()
+	if info != nil && info.Size() == 0 {
+		fmt.Fprintf(f, "# kvdb 基准报告\n\n由 `kvdb-bench` 生成。每一节是一次独立的运行记录。\n\n---\n\n")
+	}
+	fmt.Fprintf(f, "## %s\n\n%s\n\n---\n\n", title, body)
+	return f.Close()
 }

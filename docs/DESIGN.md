@@ -155,8 +155,8 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 - **Data Block 内部**：每条 entry 是 `shared_len:uvarint | unshared_len:uvarint | value_len:uvarint | key_delta | value`，
   前缀压缩的基准是**每 16 条一个的重启点**（`restartInterval = 16`）。重启点数组倒序写在块尾，
   最后跟一个 `fixed32` 的重启点个数。块内查找先二分重启点，再在段内线性扫。
-- **块尾（trailer，5 字节）**：`compression_type(1B) + crc32c(4B，掩码后)`。M2 的压缩类型恒为 0（不压缩），
-  但长度先按最终形态留出，M5 加压缩不用改格式。
+- **块尾（trailer，5 字节）**：`compression_type(1B) + crc32c(4B，掩码后)`。M5 起该字节实装：0 = 不压缩，1 = Snappy，2 = zlib（flate.BestSpeed）。
+  压缩在"块写满"时按块独立判断，压完省不下 1/8 就原样存储，策略见 9.25。
 - **Index Block 的 key 是数据块的 max key**（不是首 key），value 是 `blockHandle{offset, size}` 的编码。
   handle 本身是 `uvarint(offset) | uvarint(size)`，长度不含 5 字节块尾。
 - **Filter Block 的偏移数组**是 `fixed32 × (N+1)`：末尾多一项"数组自身起点"当哨兵，
@@ -194,9 +194,9 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | **WriteBatch** | 强烈建议 | 一次 WAL append 完成多条写，顺带拿到原子性 |
 | **Snapshot / MVCC** | 强烈建议 | 序列号 + 快照读。**建议一开始就在 key 里留 seq 字段**，后补代价极大 |
 | **Group Commit** | 建议 | 并发写合并成一次 fsync，高并发吞吐的关键（M4 已完成，见 9.18） |
-| **块压缩** | 建议 | Snappy / LZ4 / ZSTD，块级压缩 |
-| **Metrics / LOG** | 建议 | 命中率、各层文件数、读写放大倍数 |
-| **Rate Limiter** | 可选 | 限制 compaction 带宽，避免挤压前台请求 |
+| **块压缩** | 建议 | Snappy / LZ4 / ZSTD，块级压缩（M5 已完成：Snappy / zlib，见 9.22） |
+| **Metrics / LOG** | 建议 | 命中率、各层文件数、读写放大倍数（M5 已完成：压缩/限流指标入 Stats，事件写 LOG，见 9.22） |
+| **Rate Limiter** | 可选 | 限制 compaction 带宽，避免挤压前台请求（M5 已完成，见 9.22） |
 | **Column Family** | 可选 | 多列族共享 WAL，各自独立 MemTable / SST |
 | **事务 / TTL / 加密** | 可选 | 单机 KV 初期全都用不上 |
 
@@ -213,7 +213,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | **M2 读优化** | Index Block + Bloom + Block Cache + Iterator | 点查不触发全文件扫描；范围扫描可用 | 已完成 |
 | **M3 写优化** | Flush + Leveled Compaction + Manifest/Version | L0 文件数收敛在阈值附近；读放大不随写入量增长 | 已完成 |
 | **M4 一致性** | Snapshot + WriteBatch + Group Commit | 并发压测下 race detector 无告警 | 已完成 |
-| **M5 生产化** | 块压缩 + 限流 + Metrics + Checkpoint | 跑通 YCSB 并输出基准报告 | 未开始 |
+| **M5 生产化** | 块压缩 + 限流 + Metrics/LOG + Checkpoint | 跑通 YCSB 并输出基准报告 | 已完成 |
 
 建议先把 M0 + M1 打通成一条完整链路，哪怕 SST 只有一个文件、查找用线性扫描——**能跑通"写入→崩溃→恢复→读回"这条闭环，比先把 SST 做得多漂亮重要得多。**
 
@@ -264,7 +264,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | M2 读优化 | **已完成** | 2026-09-18 | 点查不再全文件扫描 + 范围扫描可用 + 读延迟的线性项被压掉约 3 个数量级，见 9.12 |
 | M3 写优化 | **已完成** | 2026-09-18 | L0 文件数被钉在触发阈值附近 + 读放大收敛为常数 + 崩溃/迁移路径均可恢复，见 9.16 |
 | M4 一致性 | **已完成** | 2026-09-18 | 并发压测下 race detector 无告警 + 组提交把 1024 次写合并成 100 余次 fsync，见 9.20 |
-| M5 生产化 | 未开始 | — | — |
+| M5 生产化 | **已完成** | 2026-09-18 | YCSB 六种负载跑通并输出基准报告（docs/BENCH.md）+ 压缩对照 6.87x + 限流/Checkpoint 验证，见 9.24 |
 
 ### 9.2 M0 交付物
 
@@ -1172,6 +1172,80 @@ memdb 98.6%、sst 76.2%、version 78.5%、wal 84.5%（kvdb 包比 M3 的 83.0% �
 
 ---
 
+### 9.22 M5 交付物
+
+| 文件 / 包 | 内容 |
+|---|---|
+| `internal/compress` | 压缩类型字节（none/Snappy/zlib）、`Compressor` 接口、按类型路由的实现表。Snappy 引入 `github.com/golang/snappy`（§7 允许的第三方库），zlib 用 stdlib flate（BestSpeed），读写缓冲均池化。 |
+| `internal/rate` | 令牌桶式字节限流器：`Request(n)` 阻塞到配额可用，大请求拆成 ≤64KB 的小笔平滑摊到时间轴；nil 接收者是空操作（与 cache 的约定一致）；`Close` 放行所有等待者（限流是软约束，停库不为它多等）。 |
+| `internal/logger` | 数据目录下的 LOG 文件：带时间戳与级别前缀的行格式，超过 `LogMaxSize` 轮转为 LOG.old；也可指向任意 io.Writer。轮转失败退化为"继续写当前文件"，不把引擎带崩。 |
+| `internal/sst`（改造） | Writer 按块独立压缩（省不下 1/8 就原样存），块尾类型字节实装；Reader 按类型字节解压后入块缓存（缓存存**解压后**内容）；新增 `BlockStats`（原子计数，Writer/Reader 共享）与 `ErrUnsupportedCompression`。 |
+| `internal/compact`（改造） | `Env` 增加 `Compression` 与 `RateLimiter`；输入侧用节流迭代器按 256KB 粒度计费、输出侧按写出字节计费；归并逻辑与 Result 不变。 |
+| `internal/version`（改造） | 抽出 `SnapshotEdit()` 与 `WriteManifest(dir, num, edit)`：前者返回"完整重建当前版本"的编辑项，后者把它写到**另一个**目录 —— Checkpoint 的元数据来源。 |
+| `options.go` | 新增 `Compression`（0=默认 Snappy，-1 显式关闭，1/2 为具体算法）、`CompactionRateLimit`、`LogMaxSize`、`Logger` 接口与 `NewFileLogger`。 |
+| `db.go` / `db_log.go` | Open 接线事件日志 / 限流器 / 块统计；`Stats` 增加 `Compression`、`RateLimit` 两组指标；事件日志三档去向（用户 Logger > LOG 文件 > 丢弃）。 |
+| `db_checkpoint.go` | `DB.Checkpoint(dir)`：一致性副本，详见 9.25。 |
+| `cmd/kvdb-bench` | 新增 `-mode ycsb`（workload A~F、Zipfian 分布、per-op 延迟分位）、`-mode compress`（三种算法对照）、`-mode checkpoint`；`-compression` / `-rate-limit` / `-l0-trigger` / `-level-base-size` / `-report`（markdown 报告）。 |
+| `docs/BENCH.md` | 基准报告：压缩对照、YCSB A~F、限流对照、zlib 对照、Checkpoint，含判读分析。 |
+
+### 9.23 M5 API 一览
+
+```go
+// Options 新增字段
+type Options struct {
+    Compression         Compression // 0=默认(Snappy)，-1=关闭，1=Snappy，2=zlib
+    CompactionRateLimit int         // 字节/秒；0 = 不限流
+    LogMaxSize          int         // LOG 轮转阈值；0=默认 1MB，负数=不写文件日志
+    Logger              Logger      // 事件日志；nil = 写数据目录下的 LOG
+}
+
+// 根包新增
+type Compression int8          // CompressionNone / CompressionSnappy / CompressionZlib / CompressionDefault
+type CompressionStats struct { /* BlocksWritten / CompressedBlocks / RawBytes / StoredBytes / Decompressions / CompressedBytesRead */ }
+type RateLimitStats struct { /* Bytes / Waits / WaitNanos */ }
+func NewFileLogger(dir string, maxSize int) (Logger, func() error, error)
+
+// DB 新增方法
+func (db *DB) Checkpoint(dir string) error // 一致性副本；目标必须为空且不同于源目录
+
+// Stats 新增字段
+Compression CompressionStats
+RateLimit   RateLimitStats
+```
+
+### 9.24 M5 验收结果
+
+全部数据见 `docs/BENCH.md`（2026-09-18，单次运行实测）。要点：
+
+| 项目 | 结果 |
+|---|---|
+| 块压缩（200k×200B 文本负载） | Snappy：41.74MB → 6.10MB（6.87x），写耗时 668ms vs 基线 660ms；zlib：3.62MB（11.66x），读 p99 可见代价 |
+| 压缩块占比 | snappy/zlib 组 10001/10003 块压缩，none 组 0/10003 —— "不划算就原样存"的策略按块生效 |
+| YCSB workload A~F | 100k keys / 100k ops 全部跑通；纯读 ~59 万 ops/s，混合写 ~28 万 ops/s |
+| Compaction 触发型负载 | 200k keys + 4MB MemTable + 16MB L1：7 轮 Compaction，读放大 0.84 probes/get |
+| 限流 | 4MB/s 配额下 Compaction 从 7 轮退到 1 轮，前台吞吐 -13%；等待发生在 Compaction 线程内部 |
+| Checkpoint | 10 万 key 副本生成 56ms（硬链接），副本独立打开且隔离性验证通过 |
+| 测试 | `go test ./...` 全绿（新增 compress/rate/logger/Checkpoint/快照导出 用例）；`-race` 无告警 |
+
+### 9.25 M5 期间新增 / 细化的决策
+
+| 决策 | 结论与理由 |
+|---|---|
+| **压缩按块独立判断，"至少省 1/8"才压** | `worthCompressing(raw, out) = out <= raw - raw/8`。一个 SST 里同时存在数据块（可压）、过滤器位图与索引块（几乎不可压），对整文件套一个算法是错误的粒度；块级判断让"压了反而更大"的块自动落到不压缩的一侧，读侧也因此少付一次解压。1/8 的门槛来自"块尾类型字节 + CRC 共 5 字节 + 解压 CPU"的最低回报线。 |
+| **块缓存存解压后的内容** | 解压一次、缓存 forever，缓存命中率直接决定解压开销；`Decompressions` 与缓存命中率构成一对互相印证的指标。代价是缓存条目比落盘数据大（压缩率 6x 时缓存同样 6x），是空间换 CPU 的显式交换。 |
+| **限流的计费粒度是 256KB，输入与输出都计费** | Compaction 的磁盘成本一半在读一半在写，只限写挡不住读放大。按 256KB 计费（而非每条记录）把限流器的锁竞争压到可忽略；`throttledIterator` 在归并迭代器外面包一层，归并逻辑对限流毫无感知。 |
+| **限流是软约束：`Close` 放行等待者而不报错** | 关库时为一个"礼貌性"的等待多停一秒毫无意义。放行而不报错与"失败语义只有停库"的整体设计一致。 |
+| **过期日志删除失败不再停库（M5 唯一的行为放宽）** | 实测（Windows + 杀毒软件）CheckPoint 读过的 WAL 在随后被 flushLoop 删除时稳定撞上"文件被另一进程占用"的瞬时失败，而旧代码把删除失败当致命错误直接 `bgErr` 停库。删除判据是单调的（编号只增），这次删不掉下次 Flush 会重试，多留一会儿的唯一代价是磁盘占用 —— LevelDB/RocksDB 的过期文件删除同样是尽力而为。判据本身不变，只是把"删不掉"从故障降级为警告。 |
+| **Checkpoint 的一致性来自"一个临界区里捕获全部状态"** | 版本、WAL 尾巴下界、快照编辑项必须在**同一个** `db.mu.RLock` 里捕获：`SnapshotEdit` 放出去之后再取，可能拿到并发 Flush/Compaction 提交之后的新版本，副本的 Manifest 就会引用根本没复制过去的文件。锁序延续 `db.mu → VersionSet.mu`，无新增风险。 |
+| **复制 WAL 尾巴前先 Flush 缓冲** | `SyncWrites=false` 时记录还在 WAL 的 bufio 里，文件上看不到 —— 最初实现漏了这一步，副本丢掉全部未落盘写入，被 `TestCheckpointCatchesUnflushedTail` 抓住。Flush 只推缓冲不做 fsync：副本只要"读得到"，持久性仍由源库的写路径负责。 |
+| **副本 Manifest 编号 = 源 nextFileNum，edit.NextFileNum 再 +1** | 编号空间在 SST / WAL / Manifest 之间共享，副本恢复时会从 edit.NextFileNum 起继续分配编号；不自增的话，副本第一次 NewManifest 就会分配出与自己的 MANIFEST 相同的编号。虽然后缀不同不会直接撞文件名，但"编号大 = 更新"这条不变式不该有例外。 |
+| **SST 优先硬链接、失败退回复制** | 同一文件系统上硬链接是 O(文件数) 的零拷贝；Compaction 之后源目录会删掉旧文件，但副本的版本握着引用，inode 不会消失。跨卷（硬链接失败）自动退化为整文件复制 + fsync。 |
+| **正在写入的 WAL 尾巴可以"多读不要紧、读坏也安全"** | Checkpoint 之后源库继续提交，复制出去的当前日志可能比捕获时刻多几条已提交记录 —— 多出来的也是真实数据，无害；写入中途的撕裂尾部由副本恢复时既有的"截断损坏尾部"路径处理。Checkpoint 因此不需要停止世界。 |
+| **Options.Compression 的零值语义与数值字段不同** | 数值字段约定"0 = 沿用默认"；Compression 的 0 同样是"默认"（= Snappy）而**不是**"关闭"，显式关闭必须写 `CompressionNone`（负数）。`DefaultOptions` 直接给 `CompressionSnappy`，保证它不经 ensureDefaults 也能过 Validate。 |
+| **事件日志三档去向，日志失败永不停库** | 用户 `Options.Logger` > 目录下 LOG 文件 > 丢弃。日志是运维辅助，不是控制流的一部分：创建失败退回丢弃实现并继续打开，所有 `logInfof/logWarnf/logErrorf` 只描述"发生了什么"，不参与任何错误处理。 |
+
+---
+
 ## 附录 A：关键数据结构
 
 ### internal key 编码
@@ -1272,7 +1346,10 @@ kvdb/
 ├── options.go              # [M0 已完成] Options / Comparer
 ├── db.go                   # [M1 已完成 / M2 扩充 / M4 接组提交] DB 对外接口、读路径、冻结 Immutable、块缓存、写队列状态
 ├── db_write.go             # [M4 已完成] 组提交：写队列、队长/跟随者、一次 fsync 服务整组、关库前排空队列
-├── db_flush.go             # [M1 已完成 / M2 扩充 / M3 扩充] 恢复（目录扫描 + WAL 重放）、后台 Flush、五段式落盘
+├── db_flush.go             # [M1 已完成 / M2 扩充 / M3 扩充 / M5 接压缩] 恢复（目录扫描 + WAL 重放）、后台 Flush、五段式落盘
+├── db_compact.go           # [M3 已完成 / M5 接限流与压缩] 后台 Compaction 循环、快照登记、停库入口
+├── db_checkpoint.go        # [M5 已完成] DB.Checkpoint：一致性副本（硬链接 / 复制 + WAL 尾巴 + 快照 Manifest）
+├── db_log.go               # [M5 已完成] 事件日志接线（用户 Logger / LOG 文件 / 丢弃三档）
 ├── db_iter.go              # [M2 已完成] NewIterator / GetSnapshot / Snapshot / 导出迭代器接口
 ├── batch.go                # [M1 已完成] WriteBatch 与它的二进制编解码（M4 的原子性载体，无需改动）
 ├── db_concurrent_test.go   # [M4 已完成] 并发一致性：组提交合并率、批次原子可见、快照隔离、停库语义、关库竞态
@@ -1292,11 +1369,14 @@ kvdb/
 │   ├── filter/             # [M2 已完成] Bloom Filter 与 Filter Block
 │   ├── cache/              # [M2 已完成] 16 分片 LRU 块缓存
 │   ├── iterator/           # [M2 已完成] Iterator 接口 + MergingIterator + DBIter
-│   ├── version/            # [M3 已完成] Manifest 追加日志、CURRENT、VersionSet、版本引用计数、VersionEdit
-│   └── compact/            # [M3 已完成] Compaction Picker（L0 按文件数 / L1+ 按容量）与多路归并执行
+│   ├── version/            # [M3 已完成 / M5 加快照导出] Manifest 追加日志、CURRENT、VersionSet、版本引用计数、VersionEdit、SnapshotEdit/WriteManifest
+│   ├── compact/            # [M3 已完成 / M5 接限流与压缩] Compaction Picker（L0 按文件数 / L1+ 按容量）与多路归并执行
+│   ├── compress/           # [M5 已完成] 块压缩：类型字节、Compressor 接口、Snappy（golang/snappy）与 flate 实现
+│   ├── rate/               # [M5 已完成] 令牌桶限流器（nil 接收者是空操作，Close 放行等待者）
+│   └── logger/             # [M5 已完成] LOG 文件与按大小轮转（LOG → LOG.old）
 └── cmd/
     └── kvdb-bench/         # [M1 雏形 / M2 扩充读路径 / M3 补放大统计 / M4 补组提交统计 / M5 完整]
-                            # write / point / scan / sweep / group
+                            # write / point / scan / sweep / group / ycsb / compress / checkpoint，-report 输出 markdown
 ```
 
 ---

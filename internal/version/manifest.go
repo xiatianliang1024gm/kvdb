@@ -257,9 +257,13 @@ func (vs *VersionSet) NewManifest() error {
 	if vs.closed {
 		return errors.New("kvdb/version: version set is closed")
 	}
-
+	// 先占用编号、再取快照：这样快照里记下的 NextFileNum 已经把这份 Manifest
+	// 自己算进去了。反过来（先取快照再占号）会让恢复后的 nextFileNum 恰好等于
+	// 这个 Manifest 的编号，下一次分配就会与它重号。
 	num := vs.nextFileNum
 	vs.nextFileNum++
+	edit := vs.snapshotEditLocked()
+
 	m, err := createManifest(vs.dir, num)
 	if err != nil {
 		return err
@@ -270,18 +274,7 @@ func (vs *VersionSet) NewManifest() error {
 		return err
 	}
 
-	snapshot := &VersionEdit{
-		ComparatorName: vs.comparerName,
-		NextFileNum:    vs.nextFileNum,
-		LastSeq:        vs.lastSeq,
-		LogNumber:      vs.logNumber,
-	}
-	for level, files := range vs.current.levels {
-		for _, fm := range files {
-			snapshot.Added = append(snapshot.Added, fm.Edit(level))
-		}
-	}
-	if err := m.Append(snapshot.Encode()); err != nil {
+	if err := m.Append(edit.Encode()); err != nil {
 		return abort(err)
 	}
 	if err := m.Sync(); err != nil {
@@ -307,4 +300,66 @@ func (vs *VersionSet) NewManifest() error {
 		_ = os.Remove(ManifestName(vs.dir, oldNum))
 	}
 	return nil
+}
+
+// snapshotEditLocked 构造一份"把当前版本完整重建出来"的 VersionEdit。
+//
+// 调用方必须持有 vs.mu（NewManifest 正在改 vs.nextFileNum，SnapshotEdit 只想读，
+// 两者的差别就在这把锁上，所以实现共用一个内部函数）。
+func (vs *VersionSet) snapshotEditLocked() *VersionEdit {
+	edit := &VersionEdit{
+		ComparatorName: vs.comparerName,
+		NextFileNum:    vs.nextFileNum,
+		LastSeq:        vs.lastSeq,
+		LogNumber:      vs.logNumber,
+	}
+	for level, files := range vs.current.levels {
+		for _, fm := range files {
+			edit.Added = append(edit.Added, fm.Edit(level))
+		}
+	}
+	return edit
+}
+
+// SnapshotEdit 返回一份"把当前版本完整重建出来"的 VersionEdit。
+//
+// 它与 NewManifest 写进本目录的内容是同一份东西，区别是这里**不碰磁盘**。
+// 需要它是为了 Checkpoint：副本要写到**另一个目录**去，而 NewManifest 只会
+// 在 vs.dir 下操作。拿到这个 edit 之后交给 WriteManifest 即可。
+//
+// 返回的 edit 里 LastSeq 只是"最后一次提交时记下的值"，可能落后于当前的
+// 已提交水位（提交之外的写入只在 WAL 里）。调用方若需要精确水位，应当自行
+// 取 max 之后覆盖 —— 见 DB.Checkpoint。
+func (vs *VersionSet) SnapshotEdit() *VersionEdit {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	return vs.snapshotEditLocked()
+}
+
+// WriteManifest 在 dir 下新建编号为 num 的 Manifest、写入 e，并把 CURRENT 指向它。
+//
+// 它与 NewManifest 的执行顺序完全一致，那条顺序不是风格问题：
+// **先写完并 fsync Manifest，最后才 rename CURRENT**。反过来的话，
+// 任何一次崩溃都会留下"CURRENT 指向一份残缺 Manifest"的状态，
+// 而这个状态在恢复时是无法与"数据真的丢了"区分开的。
+func WriteManifest(dir string, num uint64, e *VersionEdit) error {
+	m, err := createManifest(dir, num)
+	if err != nil {
+		return err
+	}
+	abort := func(err error) error {
+		m.Close()
+		os.Remove(m.path)
+		return err
+	}
+	if err := m.Append(e.Encode()); err != nil {
+		return abort(err)
+	}
+	if err := m.Sync(); err != nil {
+		return abort(err)
+	}
+	if err := writeCurrent(dir, num); err != nil {
+		return abort(err)
+	}
+	return m.Close()
 }

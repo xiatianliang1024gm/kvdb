@@ -19,7 +19,7 @@ internal/ 下按模块切分 key / memdb / wal / sst / filter / cache / version 
 - M5 生产化：未开始
 
 ## git
-已 init。基线 `6a375c1`（M0+M1+M2），`683e9c3`（M3）。
+已 init。基线 `6a375c1`（M0+M1+M2），`683e9c3`（M3），`1de8952`（M4）。
 中文 commit message 用 Write 写进 `_commitmsg.log` 再 `git commit -F`（`/_*.log` 已被忽略）。
 Bash 工具能跑 git 本身，但**别接管道**（coreutils 缺失）。
 

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 
+	"kvdb/internal/compress"
 	"kvdb/internal/filter"
 	"kvdb/internal/key"
 )
@@ -62,8 +64,9 @@ const (
 	// BlockTrailerLen 是每个块尾部的字节数：压缩类型 1 字节 + CRC32C 4 字节。
 	BlockTrailerLen = 5
 
-	// blockCompressionNone 表示块未压缩。压缩在 M5 引入，类型字节先占位。
-	blockCompressionNone byte = 0
+	// blockCompressionNone 表示块未压缩。它在 M2 就占好了位，因此 M5 引入压缩
+	// **不需要改文件格式**，M2 写出的文件（类型 0）也照样能读。
+	blockCompressionNone byte = byte(compress.TypeNone)
 
 	// restartInterval 是数据块内重启点的间隔：每 16 条记录一个重启点。
 	//
@@ -80,6 +83,13 @@ const (
 
 	// filterMetaPrefix 是 MetaIndex 里过滤器条目的 key 前缀。
 	filterMetaPrefix = "filter."
+
+	// compressionBreakEven 是"压缩划不划算"的判据：压缩后至少要省下 1/8。
+	//
+	// 沿用 LevelDB 的取值。它与块内的数据形态强相关 —— 过滤器位图与小块索引
+	// 压缩后往往更大，所以每个块都要独立判断，不能按文件甚至按库一刀切。
+	// 不划算时就原样存储（类型字节回到 0），读路径也能少一次解压。
+	compressionBreakEven = 8
 )
 
 var (
@@ -97,7 +107,85 @@ var (
 
 	// ErrCorruptBlock 表示块 CRC 校验失败，或块/索引结构非法。
 	ErrCorruptBlock = errors.New("kvdb/sst: corrupt block")
+
+	// ErrUnsupportedCompression 表示块尾的类型字节本引擎不认识。
+	//
+	// 它**不可容忍**：把它当"未压缩"处理会把一段压缩流交给上层解析，
+	// 得到一堆看似合法、实际全是乱码的 key —— 静默的数据损坏。
+	// 这个错误通常意味着"文件来自更新的版本"，用户需要知道这一点。
+	ErrUnsupportedCompression = errors.New("kvdb/sst: unsupported block compression type")
 )
+
+// BlockStats 汇总块压缩在读写两侧的规模。
+//
+// 它是**原子量的集合**，因此可以被多个 Writer / Reader 并发累加：DB 全程只持有
+// 一份，把它通过 WriterOptions / OpenOptions 交给每条流水线，最后读出来就是全库
+// 的压缩效果 —— 不需要在各个写入点做汇总，也不会因为文件被删掉而丢统计。
+//
+// 它不能按值复制（含 atomic），必须始终以指针使用。
+type BlockStats struct {
+	// BlocksWritten 是写出的块总数（数据块 + 过滤器 / 元索引 / 索引块）。
+	BlocksWritten atomic.Int64
+	// CompressedWritten 是其中真正以压缩形态落盘的块数。
+	//
+	// 它与 BlocksWritten 的差值里既有"不划算所以没压"的块（过滤器位图、小索引块），
+	// 也有"压了反而更大"的块 —— 两者都正确地落在了不压缩这一侧。
+	CompressedWritten atomic.Int64
+	// RawBytesWritten 是这些块的原始（未压缩）字节数之和。
+	RawBytesWritten atomic.Uint64
+	// StoredBytesWritten 是它们实际落盘的字节数之和（含未压缩的块）。
+	//
+	// 压缩比 = RawBytesWritten / StoredBytesWritten。
+	StoredBytesWritten atomic.Uint64
+	// Decompressions 是读取时实际发生解压的次数。
+	//
+	// 它只在块缓存未命中、且那一块确实是压缩存储时才会增加 ——
+	// 于是这个数与缓存命中率是一对：命中率高时它自然低。
+	Decompressions atomic.Int64
+	// CompressedBytesRead 是读进来待解压的字节数之和，用于估算解压吞吐。
+	CompressedBytesRead atomic.Uint64
+}
+
+// Snapshot 返回一份可读的统计副本。
+func (s *BlockStats) Snapshot() BlockStatsSnapshot {
+	if s == nil {
+		return BlockStatsSnapshot{}
+	}
+	return BlockStatsSnapshot{
+		Blocks:         s.BlocksWritten.Load(),
+		Compressed:     s.CompressedWritten.Load(),
+		RawBytes:       s.RawBytesWritten.Load(),
+		StoredBytes:    s.StoredBytesWritten.Load(),
+		Decompressions: s.Decompressions.Load(),
+		CompressedRead: s.CompressedBytesRead.Load(),
+	}
+}
+
+// BlockStatsSnapshot 是 BlockStats 的一次性读数。
+type BlockStatsSnapshot struct {
+	Blocks         int64
+	Compressed     int64
+	RawBytes       uint64
+	StoredBytes    uint64
+	Decompressions int64
+	CompressedRead uint64
+}
+
+// Ratio 返回压缩比（原始字节 / 落盘字节）。没有写过块时返回 0。
+func (s BlockStatsSnapshot) Ratio() float64 {
+	if s.StoredBytes == 0 {
+		return 0
+	}
+	return float64(s.RawBytes) / float64(s.StoredBytes)
+}
+
+// SavedPercent 返回省下的字节占比，供日志直接打印。
+func (s BlockStatsSnapshot) SavedPercent() float64 {
+	if s.RawBytes == 0 {
+		return 0
+	}
+	return 100 * (1 - float64(s.StoredBytes)/float64(s.RawBytes))
+}
 
 // blockHandle 指向文件里的一个块。
 type blockHandle struct {

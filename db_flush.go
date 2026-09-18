@@ -363,6 +363,8 @@ func (db *DB) flushLoop() {
 				} else {
 					db.counters.flushFiles.Add(1)
 					db.counters.flushBytes.Add(meta.Size)
+					db.logInfof("flush done: sst=%s level=0 entries_from_log bytes=%s",
+						sst.FileName(meta.Num), humanBytes(meta.Size))
 				}
 			}
 			if err == nil && db.imm == imm {
@@ -432,6 +434,8 @@ func (db *DB) flushMemTable(m *memdb.MemTable, num uint64) (*version.FileMeta, e
 	w, err := sst.NewWriter(path, db.cmp, sst.WriterOptions{
 		BlockSize:       db.opts.BlockSize,
 		BloomBitsPerKey: db.opts.BloomBitsPerKey,
+		Compression:     db.opts.Compression.toType(),
+		BlockStats:      db.blockStats,
 	})
 	if err != nil {
 		return nil, err
@@ -591,6 +595,11 @@ func removeSSTFile(dir string, num uint64) {
 //
 // 判据是 LevelDB 的那一条：编号小于 min(当前 MemTable 的日志编号,
 // Immutable 的日志编号) 的日志，其内容一定已经落进 SST，可以安全删除。
+//
+// 删除失败**不算致命**：判据是单调的（编号只增），这次删不掉下次 Flush 还会再试，
+// 多留一会儿的唯一代价是磁盘占用。而把它当成停库理由是灾难 —— 杀毒软件、
+// 索引服务、备份程序都会短暂占用刚被读过的文件，Windows 上尤其常见，
+// 因为这点"可能 transient 的删除失败"把整个引擎停下完全不成比例。
 func (db *DB) removeObsoleteLogsLocked() error {
 	minNum := db.mem.LogNumber()
 	if db.imm != nil && db.imm.LogNumber() < minNum {
@@ -601,10 +610,14 @@ func (db *DB) removeObsoleteLogsLocked() error {
 		return err
 	}
 	for _, num := range logs {
-		if num < minNum {
-			if err := wal.RemoveLog(db.opts.Dir, num); err != nil {
-				return err
+		if num >= minNum {
+			continue
+		}
+		if err := wal.RemoveLog(db.opts.Dir, num); err != nil {
+			if !os.IsNotExist(err) {
+				db.logWarnf("could not remove obsolete log %06d.log (will retry on the next flush): %v", num, err)
 			}
+			continue
 		}
 	}
 	return nil
