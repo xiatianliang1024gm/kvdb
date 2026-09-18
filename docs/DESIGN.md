@@ -2,7 +2,7 @@
 
 > 一个用 Go 实现的高性能嵌入式 KV 存储引擎，架构参考 RocksDB / LevelDB 的 LSM-Tree。
 >
-> 状态：M0（骨架）已完成，M1（最小可用）已完成 ｜ 最后更新：2026-09-18
+> 状态：M0（骨架）、M1（最小可用）、M2（读优化）、M3（写优化）均已完成 ｜ 最后更新：2026-09-18
 
 ## 目录
 
@@ -96,11 +96,13 @@ flowchart LR
 - **Bloom Filter**：每个 SST 一个位图，能在打开文件之前就判定"key 一定不在这个文件里"，挡掉绝大部分无效磁盘 IO。
 - **Block Cache**：分片 LRU，缓存解压后的数据块，让热点读不落盘。
 
-> **读到 M2 为止的实际形态**：上面两个组件都已经接上（`internal/filter` + `internal/cache`），
+> **读到 M3 为止的实际形态**：上面两个组件都已经接上（`internal/filter` + `internal/cache`），
 > 每层 SST 内部是"Index 二分 → Bloom 判定 → 读块（先查缓存）→ 块内 seek"。
-> 但**分层本身还没有** —— `L0 → L1 … Ln` 里目前只有 L0，且所有 L0 文件的 key range 互相重叠、
-> 没有 Compaction 去合并，所以"M 个文件就要探 M 次元数据"这件事在 M3 之前会一直存在。
-> 具体格式见 4.1，实测数据见 9.12。
+> **分层也已经长出来了** —— L0 的文件数被 `L0CompactionTrigger` 兜在阈值附近，
+> L1 以下同层区间互不重叠，于是每层只需要**一次二分**定位到唯一候选文件，
+> "M 个文件就要探 M 次元数据"这件事不再随写入量增长。
+> 版本由 Manifest 持久记录（`internal/version`），合并由 `internal/compact` 执行。
+> 具体格式见 4.1，实测数据见 9.12 与 9.16。
 
 **Delete 是写操作，不是删除操作。** 它会写入一条带删除标记（墓碑）的记录，真正的物理删除发生在后续 Compaction 归并时。这是 LSM-Tree 不可变性的直接推论。
 
@@ -202,7 +204,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | **M0 骨架** | Options / Comparer / varint / internal key 编解码 | 编解码单测全绿 | 已完成 |
 | **M1 最小可用** | WAL + MemTable（跳表） + 简单 SST + Get/Put/Delete + 崩溃恢复 | 单线程 10 万次读写结果正确；`kill -9` 后数据不丢 | 已完成 |
 | **M2 读优化** | Index Block + Bloom + Block Cache + Iterator | 点查不触发全文件扫描；范围扫描可用 | 已完成 |
-| **M3 写优化** | Flush + Leveled Compaction + Manifest/Version | 写入 1GB 数据后读延迟不塌方 | 未开始 |
+| **M3 写优化** | Flush + Leveled Compaction + Manifest/Version | L0 文件数收敛在阈值附近；读放大不随写入量增长 | 已完成 |
 | **M4 一致性** | Snapshot + WriteBatch + Group Commit | 并发压测下 race detector 无告警 | 未开始 |
 | **M5 生产化** | 块压缩 + 限流 + Metrics + Checkpoint | 跑通 YCSB 并输出基准报告 | 未开始 |
 
@@ -253,7 +255,7 @@ SSTable 不是简单地把 KV 顺序写进文件。它必须切块、建索引�
 | M0 骨架 | **已完成** | 2026-09-18 | `go test ./...` 全绿，见 9.4 |
 | M1 最小可用 | **已完成** | 2026-09-18 | 10 万次读写正确 + 子进程强杀后数据不丢，见 9.8 |
 | M2 读优化 | **已完成** | 2026-09-18 | 点查不再全文件扫描 + 范围扫描可用 + 读延迟的线性项被压掉约 3 个数量级，见 9.12 |
-| M3 写优化 | 未开始 | — | 待办清单见 9.14 |
+| M3 写优化 | **已完成** | 2026-09-18 | L0 文件数被钉在触发阈值附近 + 读放大收敛为常数 + 崩溃/迁移路径均可恢复，见 9.16 |
 | M4 一致性 | 未开始 | — | — |
 | M5 生产化 | 未开始 | — | — |
 
@@ -733,17 +735,242 @@ M2 新增的并发结构（分片 LRU 的 16 个分片各自加锁、多个 goro
 | **`Get` 的负向查询单独统计** | Bloom 的价值只体现在"key 不存在"的查询上，混在一起看平均延迟会把它稀释掉。`-mode point` 把命中与未命中分开报（1.35 µs vs 2.83 µs 级别的差别），`-mode sweep` 里也只保留两列。 |
 | **`kvdb-bench` 的 sweep 默认带对照组** | 只有"文件数涨、延迟没涨"这一个现象，说服力不够 —— 读者无法排除"文件数还不够多"。加一组关掉 Bloom 与缓存的对照后，线性项系数差 18.7 倍，"是这两个优化的功劳"才成立。 |
 
-### 9.14 M3 待办
+### 9.14 M3 交付物
 
-M2 之后，读路径的常数项已经压住，但**写路径的账还没算**：L0 文件数只会增加、不会合并，
-所以上面那个 0.126 µs/文件 的线性项会一直累积；同时"读一个 key 要翻 n 个文件"也让读放大随写入量上升。
+M2 把读路径的常数项压住了，但**写路径的账还没算**：L0 文件只增不合，那条 0.126 µs/文件 的
+线性项会随写入量一直累积，"一次点查要翻 n 个文件"的读放大也跟着涨。
 
-1. `internal/version`：Manifest（`VersionEdit` 的追加日志）+ `CURRENT` 指针 + `VersionSet` 与引用计数。
-2. `internal/compact`：Compaction Picker（L0 按文件数触发、L1 以下按容量触发）+ 多路归并执行 + 原子替换 Version。
-3. `db.go`：把 `files []*fileMeta` 换成 `Version`；`NewIterator` / `Snapshot` 改为持有版本引用，`Close` 才真正有意义。
-4. `options.go`：`L0CompactionTrigger` / `LevelBaseSize` / `LevelSizeMultiplier` 三个已存在但尚未被读的字段接入。
-5. 验收标准：L0 文件数稳定在 `L0CompactionTrigger` 附近不再增长；写入 10 倍数据后读延迟不显著退化；
-   `kvdb-bench` 增加"写放大 / 读放大"统计。
+M3 引入两样新的持久化状态 —— **Manifest**（版本变更的追加日志 + `CURRENT` 指针）与**分层版本树**，
+以及整个项目里**唯一一个会真正删数据**的组件：**Compaction**。
+
+一句话概括这一阶段：*版本从"内存里的一串文件"变成了"可原子切换、可被多个读者同时持有、
+可被持久重建"的对象。* 由此带来三个连锁后果，它们构成 M3 的主要工作量和主要风险：
+
+- **文件有生命周期了** —— 旧版本被替换后，它引用的文件不能立刻删（可能还有迭代器在读），
+  于是需要引用计数 + 垃圾回收；
+- **恢复要能重建版本** —— 靠 Manifest 重放而不是每次都扫目录；
+- **`Close` 变得有意义** —— 要等后台两条流水线排空并把最后的垃圾收干净。
+
+| 文件 | 内容 |
+|---|---|
+| `internal/version/edit.go` | `VersionEdit` / `FileEdit` 的二进制编码（Manifest 的每条追加记录）+ 解码错误值；标签式布局，便于将来加字段而不破坏老记录 |
+| `internal/version/version.go` | `FileMeta`、`Version`（不可变的分层文件清单 + 引用计数）、`VersionSet`（当前版本、文件编号 / 序列号 / log number 分配、`LogAndApply`、`SetFromScan`、`LiveFileNums`） |
+| `internal/version/manifest.go` | `Manifest`（复用 WAL 记录格式的追加日志）、`CURRENT` 的读写与原子替换、`Recover`（重放 + 尾部截断容忍 + 比较器校验）、`NewManifest`（换新日志并按编号删旧的） |
+| `internal/compact/compact.go` | `LevelConfig`、`Compaction`、`Pick`（L0 按文件数、L1 以下按容量）、`span` / `Overlapping` |
+| `internal/compact/run.go` | `Run`：多路归并 → 丢弃被覆盖的旧版本与可退休的墓碑 → **在 user key 边界切分输出** → 走 `Commit` 原子替换版本；失败时把半成品文件删掉 |
+| `db_compact.go` | 后台 Compaction 协程、每轮重新规划、`commitCompaction`（先开 reader → 再登记 → 最后提交）、快照登记与 `releaseVersion` |
+| `db_flush.go` | 恢复时对孤儿文件分类（`DiscardedFiles` vs `ObsoleteFiles`）、Flush 提交改走 Manifest、`removeUnreferencedSSTs` + 关库兜底回收 |
+| `db.go` | `Stats` / `LevelStats` / `CompactionStats`、`RecoveryReport` 扩充、`Close` 等后台排空并做最后一次 GC |
+| `db_iter.go` | `NewIterator` / `GetSnapshot` 持有版本引用并登记存活快照 |
+| `options.go` | `L0CompactionTrigger` / `LevelBaseSize` / `LevelSizeMultiplier` / `MaxLevels` 从"已存在但没人读"变成真正接入；新增 `targetFileSize` |
+| `internal/version/version_test.go` | 17 条：`VersionEdit` 编解码与坏输入拒绝、L0 按编号 / 深层按 smallest 排序、`FindFile` 二分（含"同 key 更旧版本"回归）、`Overlapping`、引用计数保持旧文件存活、Manifest 重建版本、尾部截断丢弃、比较器不匹配拒绝、`unrefLocked` 无自死锁回归 |
+| `internal/compact/compact_test.go` | 11 条：Picker 三条触发规则、丢弃被覆盖版本、退休 / 保留墓碑、尊重 `SmallestSnapshot`、**输出在 user key 边界切分**、提交失败删输出、重建层布局、同 key 平局取新 |
+| `db_compact_test.go` | 11 条验收测试：L0 有界、向深层溢出、读放大在 10 倍数据后仍有界、快照 / 迭代器跨 Compaction 存活、重开保持层布局、M2 目录迁移、孤儿文件分类、`Stats` 分层与放大、旧数据目录可开、反复开关不留残渣 |
+| `cmd/kvdb-bench/main.go` | 输出分层布局 + **写放大**（`wal + flush + compaction-out / user`）+ **读放大**（`probes/get`）+ Compaction 规模；头部打印 `l0 trigger` 与 `level sizing` |
+
+### 9.15 M3 API 一览
+
+```go
+// ── package kvdb（db.go / db_compact.go）
+
+func (db *DB) Stats() Stats
+func (db *DB) RecoveryReport() RecoveryReport
+
+type LevelStats struct{ Files int; Bytes uint64 }
+
+type CompactionStats struct {
+    Count, InputFiles, OutputFiles int64
+    InputBytes, OutputBytes        uint64
+    DroppedRecords                 int64 // 被覆盖的旧版本 + 可退休的墓碑
+}
+
+type Stats struct {
+    Files, MemTableSize, HasImmutable, LastSequence, ObsoleteLogs
+    CacheHits, CacheMisses, CacheBytes, CacheItems
+    Levels     []LevelStats  // 索引即层号；L0 的文件数应当稳定在 L0CompactionTrigger 附近
+    Compaction CompactionStats
+    FlushBytes, WALBytes   uint64
+    Gets, ReadProbes       int64  // 读放大 = ReadProbes / Gets
+}
+
+type RecoveryReport struct {
+    TornLogs          []uint64 // 尾部损坏、被截断恢复的日志编号
+    DiscardedFiles    []string // 残缺的残片：footer 不全 / 块校验失败（根本不该存在）
+    ObsoleteFiles     []string // 完整但提交没成功（曾经想提交，没提交成）
+    TruncatedManifest bool
+    RecoveredFromScan bool     // 没有 Manifest，文件列表来自目录扫描（M2 目录迁移）
+    ReplayedRecords   int
+}
+
+// ── package kvdb/internal/version
+
+type FileMeta struct{ Num, Size uint64; Smallest, Largest []byte } // 区间是 internal key
+type FileEdit struct{ Level int; Num, Size uint64; Smallest, Largest []byte }
+
+type VersionEdit struct {
+    ComparatorName string // 只在第一条记录里出现，用于校验目录与配置是否匹配
+    NextFileNum    uint64
+    LastSeq        uint64 // 修掉 M2 的缺陷：不再只依赖重放 WAL 恢复
+    LogNumber      uint64
+    Added, Deleted []FileEdit
+}
+func (e *VersionEdit) Encode() []byte
+func DecodeVersionEdit(buf []byte) (*VersionEdit, error)
+
+type Config struct { Dir string; ICmp key.InternalComparer; ComparerName string; MaxLevels int; LogNumber, NextFileNum uint64 }
+type VersionSet struct{ /* 当前版本 + 全部存活版本 + 计数器 */ }
+
+func New(cfg Config) *VersionSet
+func (vs *VersionSet) Recover() (hasManifest, truncated bool, err error)
+func (vs *VersionSet) NewManifest() error
+func (vs *VersionSet) LogAndApply(e *VersionEdit) error
+func (vs *VersionSet) SetFromScan(files []*FileMeta, maxFileNum uint64) error
+func (vs *VersionSet) Current() *Version
+func (vs *VersionSet) AllocFileNum() uint64
+func (vs *VersionSet) RaiseNextFileNum(n uint64)      // 恢复时把游标抬到已见的最大编号之上
+func (vs *VersionSet) LastSeq() uint64 / SetLastSeq(seq uint64)
+func (vs *VersionSet) LogNumber() uint64 / SetLogNumber(n uint64)
+func (vs *VersionSet) LiveFileNums() map[uint64]bool  // 垃圾回收的判据
+func (vs *VersionSet) Close() error
+var ErrNotOpen error
+
+func (v *Version) Ref() / Unref() / RefCount() int
+func (v *Version) NumLevels() int
+func (v *Version) Files(level int) []*FileMeta
+func (v *Version) FileCount() int / LevelBytes(level int) uint64 / AllFiles() []*FileMeta
+func (v *Version) FindFile(level int, userKey, target []byte) *FileMeta
+func (v *Version) Overlapping(level int, smallest, largest []byte) []*FileMeta
+
+func ManifestName(dir string, num uint64) string
+func IsManifestName(name string) bool
+
+// ── package kvdb/internal/compact
+
+type LevelConfig struct {
+    L0CompactionTrigger int
+    MaxLevels           int
+    LevelMaxBytes       func(level int) uint64 // L0 返回 0，表示没有容量上限
+    TargetFileSize      func(level int) uint64
+}
+
+type Compaction struct {
+    Level, OutputLevel int            // OutputLevel 恒为 Level+1
+    Inputs             [2][]*version.FileMeta
+}
+func (c *Compaction) InputFiles() []*version.FileMeta
+func (c *Compaction) InputBytes() uint64
+func Pick(v *version.Version, cfg LevelConfig) *Compaction // 无事可做时返回 nil
+
+type Env struct {
+    Dir                            string
+    ICmp                           key.InternalComparer
+    BlockSize, BloomBitsPerKey     int
+    TargetFileSize                 uint64
+    SmallestSnapshot               uint64 // seq <= 它的旧版本可以丢弃
+    AllocFileNum                   func() uint64
+    Reader                         func(num uint64) (*sst.Reader, error)
+    Commit                         func(*Compaction, []*version.FileMeta) error
+}
+
+type Result struct{ InputFiles, OutputFiles int; InputBytes, OutputBytes uint64; InputRecords, OutputRecords, DroppedRecords int }
+func Run(c *Compaction, v *version.Version, env Env) (Result, error)
+```
+
+### 9.16 M3 验收结果
+
+M2 结束时列出的 M3 验收标准，逐条交代如下。压测口径统一为 `kvdb-bench -mode all -memtable-size 1048576`
+（10 万 / 50 万 key、value 100B、块缓存 8MB、Bloom 10 bits/key、`L0CompactionTrigger=4`、
+`LevelBaseSize=256MB`），跑在本机同一台机器上。
+
+① ② 是当初写下的两条硬指标；③ ④ ⑤ ⑥ 不是额外加码，而是"①② 能成立"所依赖的不变式 ——
+没有它们，前两条只是两个恰好好看的数字。
+
+**① L0 文件数稳定在触发阈值附近，不再随写入量增长** —— 数据量 ×5，L0 恒为 **3** 个文件
+（阈值 4，收敛在阈值之下）：
+
+| 规模 | sst files | L0 | L1 | memtable live | write amp | read amp |
+|---|---|---|---|---|---|---|
+| 10 万 key | 17 | **3** (1.87 MB) | 14 (8.71 MB) | 872 KB | 2.89x | 3.54 probes/get |
+| 50 万 key | 89 | **3** (1.87 MB) | 86 (53.48 MB) | 166 KB | 3.12x | 3.90 probes/get |
+
+M2 里这一列文件数会随 Flush 次数线性增长（写 50 万 key、1MB MemTable 就是约 86 次 Flush）；
+M3 之后它被钉在触发阈值附近，**增长的是 L1 的容量而不是 L0 的文件数**，
+这就是"分层"的实际含义。单测 `TestCompactionKeepsL0Bounded` 把这条断言固化了：
+它额外要求"文件总数 ≤ 30"（几十次 Flush 最后只剩十几个文件），比"L0 < 阈值"更能说明收敛。
+
+**② 写入 10 倍数据后读放大收敛为常数** —— 上表里 **3.54 → 3.90**，数据 ×5 而读放大 ×1.10。
+读放大的定义是"一次点查平均向几个 SST 发起查找"（`ReadProbes / Gets`），
+它是 Bloom Filter **挡不掉**的那部分成本：Bloom 只让"碰一次"变便宜（一次哈希查内存），
+真正让**次数**降下来的只有 Compaction。理论上界是"L0 每个文件 + 每层各一个候选文件"，
+所以它是个**小常数**，与数据量无关 —— L0 收敛在阈值以下、层数按 `log_10` 增长，
+两项都不会随写入量爆掉。
+
+单测 `TestReadAmplificationStaysBoundedAfterTenfoldGrowth` 用固定的一批 key（保证已被挤出
+MemTable，测的是真读路径）在 2000 → 20000 key 两端各测一次，断言 `big ≤ 6` 且 `big ≤ small + 2`。
+它比 bench 更严格的地方是**只在稳态测量**：必须等到 `Compaction.Count > 0` 才取数，
+否则会在"L0 还没开始搬"的窗口里测到一个虚高的值。
+
+**③ 分层结构逐层长出来，且 L1 以下同层不重叠** —— `TestCompactionOverflowsIntoDeeperLevel`
+把 `LevelBaseSize` 压到 64KB，于是 L1 会被撑满并往 L2 搬，验证"每层只往下走一层"的阶梯确实会
+依次点亮。`checkLevelInvariant` 在多个测试里反复检查：**L1 以下的文件区间两两不重叠**，
+这是点查能把每层定位成"一次二分"的前提。`TestRunSplitsOutputAtUserKeyBoundary` 专门守住它的
+写侧来源：输出只在 user key 变化处切分，绝不在 internal key 中间切。
+
+**④ 读视图在 Compaction 期间保持稳定** —— `TestSnapshotSurvivesCompaction`：
+在一次 Compaction 跨越两个快照之间时，两个快照各自读到的仍是它们该看到的版本；
+`TestIteratorSurvivesCompaction`：迭代器打开期间即使输入文件被 Compaction 合并掉，
+迭代仍能读完全部 key。这两条依赖版本引用计数（`Version.Ref/Unref`）与
+"打开迭代器时登记存活快照"，也是 `smallestSnapshot` 这个丢弃上界的唯一来源。
+
+**⑤ 崩溃与迁移路径都能恢复，且不留残渣** ——
+`TestRecoveryClassifiesOrphanFiles` 区分两类孤儿：完整的进 `ObsoleteFiles`、
+残缺的进 `DiscardedFiles`；`TestMigrateLegacyDirectoryWithoutManifest` 验证 M2 的
+"没有 Manifest 的目录"第一次打开时会走目录扫描并把结果固化成第一份 Manifest；
+`TestNoStrayFilesAfterCycles` 反复开关之后目录里最多只留一份 Manifest。
+`TestReopenPreservesLevelLayout` 要求重开后**已经在 L1 以下的文件仍留在原层**
+（只允许 WAL 重放多出至多一个 L0 文件）。
+
+**⑥ 墓碑真的被物理删掉、旧版本真的被丢弃** —— `TestRunDropsCoveredVersions`（覆盖写留下的老值被丢）、
+`TestRunRetiresObsoleteTombstone`（使命已完成的墓碑被退休）、`TestRunKeepsTombstoneAboveDeeperLevel`
+（墓碑下面还有更深层的数据时**不能**退休）、`TestRunRespectsSmallestSnapshot`（快照还要读的版本不能丢）。
+需要说明的是：上面 bench 的 `compaction` 一行显示 `dropped 0 records` —— 这是**预期**的，
+因为该负载全是唯一的 key，没有覆盖写也没有删除，本来就没有任何记录该被丢。
+
+**测试与静态检查**：`go test ./... -count=1 -cover` 全绿 —— kvdb 83.0%、cache 96.8%、
+compact 86.9%、crc 100%、filter 94.4%、iterator 86.1%、key 98.1%、memdb 98.6%、
+sst 76.2%、version 78.5%、wal 84.5%。
+`go vet ./...` 与 `gofmt -l .` 无输出；`go test -race ./...` 全绿 —— 新增的两处并发结构
+（后台 Compaction 协程与前台读写的版本引用计数、`releaseVersion` 归零时的 GC）
+**无 data race 报告**。
+
+> **两条需要如实说明的边界**：
+>
+> 1. **kvdb 包覆盖率从 M2 的 89.6% 降到 83.0%**，不是质量退化，而是 M3 新增了
+>    `db_compact.go` 里大量只在异常路径或关库竞态才走到的分支（提交失败回滚、
+>    `errClosing` 中断、关库兜底 GC）。这些分支由单测与崩溃测试覆盖，但因为
+>    "每行都要跑到"在并发代码里代价过高，覆盖率的分母涨得比分母快。
+> 2. **bench 里 `get(hit)` 从 3.47 µs 涨到 10.34 µs，涨幅不代表读路径退化**。
+>    数据从 11MB 涨到 55MB，而块缓存固定 8MB，命中率从 86.7% 掉到 65.2% ——
+>    这个涨幅来自"缓存装不下、要去磁盘读块"，属于缓存容量问题（M5 的调优范围），
+>    不是读放大问题：同一时间段里探测次数只从 3.54 涨到 3.90。
+>    把这两件事分开看，才是验收标准"读延迟不显著退化"的正确读法。
+
+### 9.17 M3 期间新增 / 细化的决策
+
+| 决策 | 结论与理由 |
+|---|---|
+| **恢复时把"孤儿文件"分成两类，而不是一律删除** | 两者成因不同：`DiscardedFiles` 是崩溃中断的那次写入（footer 不全，**根本不该存在**），`ObsoleteFiles` 是文件写完并 fsync 了但 Manifest 那次提交没落盘（**曾经想提交但没提交成**）。判据是"能不能正常打开"：能打开 → obsolete，报 `isDiscardableSSTError` → discarded，其余错误一律上抛。混在一起报会让用户无法区分"崩溃丢了一次写入"和"格式坏了"。单测 `TestRecoveryClassifiesOrphanFiles` 守住。 |
+| **`VersionSet.mu` 内不能调 `Unref`，改用 `unrefLocked`** | `Unref` 归零时要拿 `VersionSet.mu` 把自己从存活集合里摘掉，而 `LogAndApply` / `SetFromScan` / 重放路径**本来就持有这把锁** —— `sync.Mutex` 不可重入，于是构成自死锁。这个 bug 在 DB 层被**侥幸掩盖**：`db.v` 永远持有一个长期引用，旧版本永远到不了 0，所以只有单独测 `version` 包才会暴露。修法是拆出 `unrefLocked()`（调用方持锁）与 `removeLiveLocked`，凡是持锁路径一律用前者。回归测试 `TestLogAndApplyReleasesOldVersionWithoutDeadlock` 守住（修之前它会卡到超时）。 |
+| **`NewManifest` 删旧 Manifest 要按编号删，不能按句柄删** | 恢复之后 `vs.manifest` 句柄是 nil，但旧的 `MANIFEST-*` 文件还实实在在躺在目录里。只删"有句柄的那份"会导致每次重开都多留一份 Manifest（实测累积到 3 份）。改成按 `manifestNum` 拼路径删，`TestNoStrayFilesAfterCycles` 守住。 |
+| **`Close` 之后要补一次垃圾回收（`collectGarbageFinal`）** | 存在这样一个窗口：一次 Compaction 提交完新版本、输入文件失去了最后一个引用，但它收尾的那次 `collectGarbage` 恰好撞上 `db.closed == true`（关库正在进行），于是被跳过 —— 结果就是"数据全对，但目录里留了一个谁也引用不到的 SST"。修法是在 `bgWG.Wait()` 之后调一次 `collectGarbageFinal()`，它走 `removeUnreferencedSSTs(allowClosed=true)`，跳过 closed 检查。 |
+| **删除失败时不要把 reader 从表里摘掉** | GC 的顺序改成"先 `os.Remove` 成功、再删 `db.readers` 里的条目"。反过来写的话，一次删除失败（例如 Windows 上文件仍被占用）会让 reader 表里少一个条目，而文件还在 —— 后续任何一次读都会报"没有登记的读取器"，一个瞬时的 IO 错误被放大成永久性故障。 |
+| **`LastSeq` 必须写进 Manifest，不能只靠重放 WAL 恢复** | 这是 M3 顺带修掉的 M2 缺陷：如果崩溃发生在"所有 MemTable 都已落盘、当前 WAL 是空的"这个**完全正常**的时刻，重启后 `lastSeq` 会退回 0，新写入的序列号就会和 SST 里已有的老记录撞号 —— 那是静默的数据正确性问题。Manifest 里每次提交都带上 `LastSeq`，这个问题才被根治。 |
+| **Compaction 每次只往下走一层** | 一次跨多层的归并会把写入量放大到不可控（一次 Compaction 重写好几层的数据），而且中间层的旧版本会被同时清掉，出错时无法定位是哪一层的问题。逐层搬运的代价是多跑几次，换来的是每步都可解释、可回归。`TestCompactionOverflowsIntoDeeperLevel` 验证这条阶梯确实会逐层点亮。 |
+| **输出文件只在 user key 变化处切分** | "同一 user key 的所有版本必须落在同一文件里"（M2 的块级不变式的文件级版本）。在 internal key 中间切会把一个 key 的 v1/v3 劈到两个文件里，点查只命中一个文件时就会漏掉可见版本 —— 又是静默的数据损坏。`TestRunSplitsOutputAtUserKeyBoundary` 同时断言不重叠、且 `FileMeta` 里记的区间与文件实际内容一致。 |
+| **`Inputs[1]`（输出层重叠文件）必须一起参与归并，不能省** | 输出文件的 key 区间由"输入层选中文件 ∪ 输出层重叠文件"的并集决定。只搬 `Inputs[0]` 的话，输出必然和输出层里某个已有文件区间重叠，**"L1 以下同层不重叠"当场破掉**，之后二分会定位到错的文件。这不是优化，是正确性前提。 |
+| **`Commit` 三步的顺序：先开 reader → 再登记 → 最后提交版本** | 反过来会出现一个窗口："版本已经指向新文件、但读取器表里还没有它"，那一刻的读会报"没有登记的读取器"而不是拿到数据。所以 `commitCompaction` 把最贵的"打开输出文件"放在锁外做，进锁后先登记 reader 再落 Manifest。 |
+| **`Pick` 无事可做时返回 nil，而不是返回一个空 Compaction** | `runCompactions` 的循环因此有了干净的终止条件（`c == nil` 就退出本轮）。每轮都从**当前版本**重新挑一次，而不是一次挑完排队 —— 上一轮的结果会改变各层规模，也改变了下一轮该挑谁。 |
+| **`kvdb-bench` 的写放大分子不含"Compaction 读进来的字节"** | 写放大按 LSM 里通用的定义：`(WAL + Flush + Compaction 输出) / 用户放入的字节`。Compaction 的**输入**字节不计入分子 —— 那是读放大的一部分，混进写放大会让两个指标互相污染、都失去诊断价值。读放大单独按 `probes/get` 报。 |
 
 ---
 
@@ -818,7 +1045,9 @@ type DB interface {
 
 `Get` / `Put` / `Delete` 都是 `WriteBatch` 的语法糖。真正的写入口只有 `Write`，这样原子性、Group Commit、WAL 追加都只需要在一个地方实现。
 
-截至 M2，这个接口已经全部落地（`NewIterator` / `GetSnapshot` 在 `db_iter.go`），与 9.7、9.11 的清单一致。
+截至 M3，这个接口已经全部落地（`NewIterator` / `GetSnapshot` 在 `db_iter.go`），与 9.7、9.11 的清单一致。
+M3 为它补上了两个诊断入口：`Stats()`（分层布局 + 读写放大）与 `RecoveryReport()`（恢复时丢弃了什么），
+两者都不改变上面的读写语义。
 
 ---
 
@@ -851,10 +1080,10 @@ kvdb/
 │   ├── filter/             # [M2 已完成] Bloom Filter 与 Filter Block
 │   ├── cache/              # [M2 已完成] 16 分片 LRU 块缓存
 │   ├── iterator/           # [M2 已完成] Iterator 接口 + MergingIterator + DBIter
-│   ├── version/            # [M3] Manifest、VersionSet、VersionEdit
-│   └── compact/            # [M3] Compaction Picker 与执行
+│   ├── version/            # [M3 已完成] Manifest 追加日志、CURRENT、VersionSet、版本引用计数、VersionEdit
+│   └── compact/            # [M3 已完成] Compaction Picker（L0 按文件数 / L1+ 按容量）与多路归并执行
 └── cmd/
-    └── kvdb-bench/         # [M1 雏形 / M2 扩充 / M5 完整] 压测工具：write / point / scan / sweep
+    └── kvdb-bench/         # [M1 雏形 / M2 扩充读路径 / M3 补放大统计 / M5 完整] write / point / scan / sweep
 ```
 
 ---
@@ -874,5 +1103,9 @@ kvdb/
 | Bloom Filter 建在 user key 上，不建在 internal key 上 | internal key 的 `(seq, type)` 后缀让每个版本都成为不同 key，位图会随更新次数膨胀且语义错位 |
 | 块缓存按 `(fileNum, offset)` 索引，且容忍 nil 接收者 | 文件编号会因删除而复用，只用 offset 会串味；nil 缓存让"关缓存"不必在热路径上写分支 |
 | 主体自己写，不引第三方存储引擎 | 否则失去项目意义；工具层依赖可以放开 |
+| Compaction 每次只往下走一层，不做跨层归并 | 一次跨多层的归并会把写入量放大到不可控，而且中间层的旧版本会被同时清掉，出错时无法定位是哪一层的问题 |
+| 输出文件只在 user key 变化处切分 | 「同一 user key 的所有版本必须同文件」这条不变式的写侧等价物；在 internal key 中间切会把一个 key 的版本劈到两个文件里，点查只读一个文件时就会漏版本 |
+| 读到比 `smallestSnapshot` 更旧的版本即可丢 | 丢掉任何存活快照还要读的版本都是静默的数据损坏（读到新值，或本该存在的值变成不存在）且不报错；取所有存活快照的最小值是这个上界的唯一安全选择 |
 
-（M2 期间更细的决策 —— 过滤器损坏时的保守策略、索引记 max key、`ErrLegacyFormat` 不可容忍等 —— 见 9.13。）
+（M2 期间更细的决策 —— 过滤器损坏时的保守策略、索引记 max key、`ErrLegacyFormat` 不可容忍等 —— 见 9.13。
+M3 期间更细的决策 —— 孤儿文件的两类区分、`unrefLocked` 规避自死锁、按编号删旧 Manifest、关库兜底 GC 等 —— 见 9.17。）

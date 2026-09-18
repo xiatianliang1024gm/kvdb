@@ -190,7 +190,7 @@ func runOnce(cfg config) (err error) {
 			return err
 		}
 	}
-	printResult(res, db)
+	printResult(cfg, res, db)
 	return nil
 }
 
@@ -592,6 +592,10 @@ func printHeader(cfg config, dir string, db *kvdb.DB) {
 		fmt.Printf("  bloom filter     disabled\n")
 	}
 	fmt.Printf("  sync writes      %v\n", opts.SyncWrites)
+	// 分层的两个参数决定了"什么时候搬、搬到哪一层"，是解读下面 level 分布的前提。
+	fmt.Printf("  l0 trigger       %d files\n", opts.L0CompactionTrigger)
+	fmt.Printf("  level sizing     L1 %s x %d, max levels %d\n",
+		humanBytes(uint64(opts.LevelBaseSize)), opts.LevelSizeMultiplier, opts.MaxLevels)
 	if cfg.sample > 0 && cfg.numKeys > 0 {
 		fmt.Printf("  key sample       %s ... %s\n", key(0), key(cfg.numKeys-1))
 	}
@@ -601,15 +605,51 @@ func printHeader(cfg config, dir string, db *kvdb.DB) {
 	}
 }
 
-func printResult(res *result, db *kvdb.DB) {
+func printResult(cfg config, res *result, db *kvdb.DB) {
 	stats := db.Stats()
 	fmt.Println()
 	fmt.Printf("  sst files        %d\n", stats.Files)
+	// 分层布局。M3 的写入优化效果几乎全在这几行里：L0 的文件数应当稳定在
+	// L0CompactionTrigger 附近（而 M2 里它会随写入量线性增长），L1 以下的
+	// 字节数应当按 LevelSizeMultiplier 呈阶梯式增长。
+	for i, lv := range stats.Levels {
+		if lv.Files == 0 && i > 0 {
+			continue
+		}
+		fmt.Printf("  level %-2d         %d files, %s\n", i, lv.Files, humanBytes(lv.Bytes))
+	}
 	fmt.Printf("  memtable live    %d bytes\n", stats.MemTableSize)
 	fmt.Printf("  last sequence    %d\n", stats.LastSequence)
 	fmt.Printf("  cache hit rate   %s (hits=%d misses=%d, %.1f MB / %d items)\n",
 		hitRate(stats.CacheHits, stats.CacheMisses), stats.CacheHits, stats.CacheMisses,
 		float64(stats.CacheBytes)/(1<<20), stats.CacheItems)
+
+	// ── 写放大 ──
+	// 定义是 LSM 里通用的那一个：引擎总共写出多少字节 / 用户放进去多少字节。
+	// 三个来源一个都不能漏 —— WAL（每条写都先落一遍）、Flush（MemTable 落成 L0）、
+	// Compaction 的输出。分子刻意不含"Compaction 读进来的字节"，那是读放大的一部分。
+	user := uint64(cfg.numKeys) * uint64(len(key(0))+cfg.valueSize)
+	written := stats.WALBytes + stats.FlushBytes + stats.Compaction.OutputBytes
+	fmt.Printf("  write amp        %s (wal %s + flush %s + compaction-out %s / user %s)\n",
+		ratio(written, user), humanBytes(stats.WALBytes), humanBytes(stats.FlushBytes),
+		humanBytes(stats.Compaction.OutputBytes), humanBytes(user))
+
+	// ── 读放大 ──
+	// 定义是"一次点查平均向几个 SST 发起查找"。这是 Bloom Filter 挡不掉的那部分成本：
+	// Bloom 只让"碰一次"变得便宜（一次哈希查内存），真正让次数降下来的是 Compaction
+	// 把散在 L0 的一堆小文件收敛成 L1 以下的少数大文件。
+	if stats.Gets > 0 {
+		fmt.Printf("  read amp         %.2f probes/get (gets=%d probes=%d)\n",
+			float64(stats.ReadProbes)/float64(stats.Gets), stats.Gets, stats.ReadProbes)
+	}
+
+	// ── Compaction 规模 ──
+	// 输入字节与输出字节的比值就是"这一层被反复搬运"的程度，是调优的直接依据。
+	if c := stats.Compaction; c.Count > 0 {
+		fmt.Printf("  compaction       %d times, in %d files %s -> out %d files %s, dropped %d records\n",
+			c.Count, c.InputFiles, humanBytes(c.InputBytes), c.OutputFiles,
+			humanBytes(c.OutputBytes), c.DroppedRecords)
+	}
 }
 
 // ── 小工具 ────────────────────────────────────────────────────────
@@ -640,6 +680,28 @@ func hitRate(hits, misses int64) string {
 		return "n/a"
 	}
 	return fmt.Sprintf("%.1f%%", 100*float64(hits)/float64(total))
+}
+
+// ratio 打印 num/den 的比值，保留两位小数；den 为 0 时返回 "n/a"。
+func ratio(num, den uint64) string {
+	if den == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.2fx", float64(num)/float64(den))
+}
+
+// humanBytes 把字节数打印成便于比较的量级。
+func humanBytes(n uint64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.2f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 func buildOptions(cfg config, dir string) kvdb.Options {

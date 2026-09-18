@@ -196,6 +196,11 @@ func (o Options) internalKeyComparer() internalComparer {
 }
 
 // levelMaxBytes 返回第 level 层的容量上限（字节）；L0 没有容量上限，返回 0。
+//
+// L0 按文件数触发、L1 以下按容量触发，这个函数就是后者的判据。
+// L1 的容量是 LevelBaseSize，之后每层乘 LevelSizeMultiplier —— 这个 10 倍关系
+// 不是随手定的：它让每层的容量与它的读写代价匹配，点查每层最多碰一个文件，
+// 于是"层数"决定了读放大，而层数只有 log_10(总数据量 / LevelBaseSize) 级别。
 func (o Options) levelMaxBytes(level int) uint64 {
 	if level == 0 {
 		return 0
@@ -203,6 +208,27 @@ func (o Options) levelMaxBytes(level int) uint64 {
 	size := uint64(o.LevelBaseSize)
 	for i := 1; i < level; i++ {
 		size *= uint64(o.LevelSizeMultiplier)
+	}
+	return size
+}
+
+// targetFileSize 返回写进第 level 层的单个输出文件的目标字节数。
+//
+// 取该层容量的 1/100，并夹在 [256KB, 64MB] 之间：
+//
+//   - 跟着容量走：下层容量大，文件也应当大，否则 L2 会堆出上万个几 KB 的小文件，
+//     光是打开它们的索引就要吃掉可观的启动时间；
+//   - 上限 64MB：一次 Compaction 的产物若太大，下次搬运它就要把这么多字节重写一遍，
+//     写放大会跟着变大；
+//   - 下限 256KB：让"一次 Compaction 输出一个文件"这个常见情形成立。
+//     测试里把 LevelBaseSize 调小就能观察到切分行为。
+func (o Options) targetFileSize(level int) uint64 {
+	size := o.levelMaxBytes(level) / 100
+	switch {
+	case size < 256<<10:
+		size = 256 << 10
+	case size > 64<<20:
+		size = 64 << 20
 	}
 	return size
 }

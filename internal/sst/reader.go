@@ -42,6 +42,10 @@ type Reader struct {
 	index     []byte
 	numBlocks int
 	filter    *filter.BlockReader
+
+	// largestKey 是文件里最大的 internal key，在 validateIndex 顺势记下（索引项的
+	// 最后一条就是它）。它让"打开一个文件就知道它的 key 上界"不必额外付出一次 IO。
+	largestKey []byte
 }
 
 // Open 打开 path 处的 SSTable：校验 Footer、读入 Index 与 Filter、逐条校验索引项。
@@ -180,7 +184,51 @@ func (r *Reader) validateIndex(index []byte) (int, error) {
 	if err := it.Error(); err != nil {
 		return 0, fmt.Errorf("%s: %w", r.path, err)
 	}
+	// 索引项的 key 是"数据块的最大 key"，所以最后一条索引项就是整个文件的最大 key。
+	r.largestKey = append(r.largestKey[:0], prev...)
 	return n, nil
+}
+
+// LargestKey 返回文件里最大的 internal key；空文件返回 nil。
+//
+// 它只在"迁移旧目录"时被用到：那种场合下文件的 key 区间必须现算，
+// 因为当时的版本元数据还不存在。正常路径上路过的每个文件，区间都由 Manifest 记着。
+func (r *Reader) LargestKey() []byte { return r.largestKey }
+
+// SmallestKey 返回文件里最小的 internal key；空文件返回 nil。
+//
+// 索引项记的是每块的最大 key，所以第一个数据块的最大 key 并不是文件的下界，
+// 必须真的把第一块读进来取它的首条记录。这次 IO 由调用方按需触发，
+// 不放进 Open —— 正常打开一个文件不该多看一个数据块。
+func (r *Reader) SmallestKey() ([]byte, error) {
+	if r.numBlocks == 0 {
+		return nil, nil
+	}
+	it, err := newBlockIter(r.index, r.icmp.Compare)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", r.path, err)
+	}
+	it.SeekToFirst()
+	if !it.Valid() {
+		return nil, it.Error()
+	}
+	h, _, err := decodeBlockHandle(it.Value())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", r.path, err)
+	}
+	block, err := r.readBlock(h)
+	if err != nil {
+		return nil, err
+	}
+	bi, err := newBlockIter(block, r.icmp.Compare)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", r.path, err)
+	}
+	bi.SeekToFirst()
+	if !bi.Valid() {
+		return nil, bi.Error()
+	}
+	return append([]byte(nil), bi.Key()...), nil
 }
 
 // checkHandle 校验块的位置确实落在数据区之内。

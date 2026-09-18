@@ -41,12 +41,23 @@ func (c InternalComparer) Name() string {
 
 // UserCompare 只比较两个 internal key 的 user_key 部分，尾缀被忽略。
 //
-// 用于判断两个 internal key 是否指向同一个 user key（例如迭代器在
-// 归并时找同名 key 的所有版本）。
+// **入参必须是 internal key**：它会各自剥掉末尾 8 字节的尾缀。传裸 user key 进来
+// 是很容易犯的错，而且症状很隐蔽 —— 短于 8 字节的 key 剥完变成空串，
+// 于是"两个不同的 key"被判成相等，一路静默地把数据当成重复版本丢掉。
+// 要比较裸 user key 请用 CompareUser。
 func (c InternalComparer) UserCompare(a, b []byte) int {
+	return c.CompareUser(UserKey(a), UserKey(b))
+}
+
+// CompareUser 比较两个**裸 user key**（不带尾缀）。
+//
+// 它与 UserCompare 成对：一个吃 internal key，一个吃 user key。分开成两个名字是
+// 刻意的——同一个函数名同时接受两种输入，就只能靠"key 到底多长"来猜，
+// 而猜错的方向是静默丢数据，代价太大。
+func (c InternalComparer) CompareUser(a, b []byte) int {
 	userCmp := bytes.Compare
 	if c.User != nil {
 		userCmp = c.User.Compare
 	}
-	return userCmp(UserKey(a), UserKey(b))
+	return userCmp(a, b)
 }

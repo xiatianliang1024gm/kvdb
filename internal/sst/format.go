@@ -4,10 +4,27 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"kvdb/internal/filter"
 	"kvdb/internal/key"
 )
+
+// Suffix 是 SSTable 文件的扩展名。
+const Suffix = ".sst"
+
+// FileName 返回编号为 num 的 SSTable 文件名。
+//
+// 编号补零到 6 位，好让"文件名排序 = 编号排序"也成立；编号本身在 SST 与 WAL
+// 之间共享同一个空间，"编号大 = 更新"这条规则因此对两种文件同时成立。
+func FileName(num uint64) string {
+	return fmt.Sprintf("%06d%s", num, Suffix)
+}
+
+// FilePath 返回编号为 num 的 SSTable 完整路径。
+func FilePath(dir string, num uint64) string {
+	return filepath.Join(dir, FileName(num))
+}
 
 // 文件格式常量与 Footer / BlockHandle 的编解码。
 //

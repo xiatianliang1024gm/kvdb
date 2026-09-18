@@ -2,8 +2,10 @@ package kvdb
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"kvdb/internal/iterator"
+	"kvdb/internal/version"
 )
 
 // ErrSnapshotReleased 表示快照已经被 Release 之后又被使用。
@@ -22,17 +24,17 @@ type IteratorOptions struct {
 // Iterator 是面向 user key 的只读有序迭代器，只支持前向遍历。
 //
 // 它呈现的是"某个序列号下的可见视图"：同一个 key 只出现一次，已删除的 key
-// 不出现，比快照更新的版本被隐藏。MemTable、Immutable MemTable 与所有 SST
-// 在它内部被归并成一条有序流，调用方不需要关心数据在哪一层。
+// 不出现，比快照更新的版本被隐藏。MemTable、Immutable MemTable 与当前版本里的
+// 所有 SST 在它内部被归并成一条有序流，调用方不需要关心数据在哪一层。
 //
 // 生命周期约定：
 //
 //   - Key() / Value() 返回的切片只在下一次 Seek / Next / Close 之前有效，
 //     并且可能直接指向块缓存的内部字节，**调用方不得修改**；需要长期持有请复制；
-//   - 迭代器持有构造那一刻的 MemTable 与 SST 引用，**不得在 DB.Close 之后继续使用**；
-//   - Close 释放迭代器持有的引用。M2 还没有需要显式释放的资源，它只是把迭代器
-//     置为失效（之后 Valid 恒为 false）；M3 引入版本引用计数后会变成必需调用，
-//     所以现在就把它放进接口，避免将来改接口。
+//   - 迭代器持有构造那一刻的**版本引用**，因此它读的文件在整个生命周期内都不会
+//     被 Compaction 删掉 —— 这也是 Close 从 M3 起变成必需调用的原因：
+//     不 Close 就等于一直拦着那次 Compaction 的输出文件被回收；
+//   - 迭代器仍然不得在 DB.Close 之后继续使用。
 type Iterator interface {
 	// SeekToFirst 定位到最小的可见 key。
 	SeekToFirst()
@@ -48,18 +50,17 @@ type Iterator interface {
 	Next()
 	// Error 返回迭代过程中遇到的首个错误。
 	Error() error
-	// Close 释放迭代器。
+	// Close 释放迭代器持有的版本引用。重复调用是安全的。
 	Close() error
 }
 
 // NewIterator 返回一个遍历当前最新视图的迭代器。
 //
-// 构造时把 MemTable、Immutable MemTable 与当前 SST 列表（从新到旧）一次性挂进
-// 归并迭代器，之后不再持有数据库锁，因此长时间扫描不会挡住写入。
+// 构造时把 MemTable、Immutable MemTable 与当前版本里的 SST（按新旧顺序）一次性
+// 挂进归并迭代器，之后不再持有数据库锁，因此长时间扫描不会挡住写入。
 //
-// 这个"挂引用而不是挂锁"的做法在本项目里是安全的，因为 MemTable 只会被追加
-// （冻结之后不再修改），SST 文件一旦写成就不再改动。M3 的 Compaction 会删除文件，
-// 届时需要给版本加引用计数，否则迭代器可能读到已被删除的文件。
+// "不持锁"能成立靠的是两件事：MemTable 只会被追加（冻结之后不再修改），
+// 以及迭代器持有的版本引用让它在读的这批文件不会被删掉。
 func (db *DB) NewIterator(opt *IteratorOptions) Iterator {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -71,41 +72,103 @@ func (db *DB) NewIterator(opt *IteratorOptions) Iterator {
 
 // newIteratorLocked 在指定快照序列号下构造迭代器。调用方必须持有 db.mu 的读锁。
 func (db *DB) newIteratorLocked(snapshot uint64, opt *IteratorOptions) Iterator {
-	children := make([]iterator.Iterator, 0, 2+len(db.files))
-	// 顺序即新旧顺序：MemTable 最新，其次是 Immutable，最后是按编号从大到小的 SST。
+	v := db.v
+	v.Ref() // 交给迭代器持有，Close 时释放
+
+	children := make([]iterator.Iterator, 0, 2+v.FileCount())
+	// 顺序即新旧顺序：MemTable 最新，其次是 Immutable，然后是 L0（从新到旧），
+	// 最后是 L1 以下的各层。归并迭代器在两条记录的 internal key 完全相同时
+	// 按下标决胜，所以这个顺序必须严格成立。
 	children = append(children, db.mem.NewIterator())
 	if db.imm != nil {
 		children = append(children, db.imm.NewIterator())
 	}
-	for i := len(db.files) - 1; i >= 0; i-- {
-		children = append(children, db.files[i].reader.NewIterator())
+	for level := 0; level < v.NumLevels(); level++ {
+		files := v.Files(level)
+		if level == 0 {
+			for i := len(files) - 1; i >= 0; i-- {
+				children = append(children, db.iteratorForFileLocked(files[i].Num))
+			}
+			continue
+		}
+		for _, f := range files {
+			children = append(children, db.iteratorForFileLocked(f.Num))
+		}
 	}
 
 	var lower, upper []byte
 	if opt != nil {
 		lower, upper = opt.LowerBound, opt.UpperBound
 	}
-	return iterator.NewDBIter(db.icmp, iterator.NewMerging(db.icmp, children...), snapshot, lower, upper)
+	return &versionedIterator{
+		DBIter: iterator.NewDBIter(db.icmp, iterator.NewMerging(db.icmp, children...), snapshot, lower, upper),
+		db:     db,
+		v:      v,
+	}
+}
+
+// iteratorForFileLocked 返回某个 SST 的迭代器。
+//
+// 读取器缺失时返回一个立即报错的迭代器（而不是 panic）：这样"版本引用了没登记的文件"
+// 这个内部缺陷会以 Error() 的形式浮出来，而不是把整个进程带走。
+func (db *DB) iteratorForFileLocked(num uint64) iterator.Iterator {
+	r, err := db.readerFor(num)
+	if err != nil {
+		return errorSource{err: err}
+	}
+	return r.NewIterator()
+}
+
+// versionedIterator 让迭代器在关闭时释放它持有的版本引用。
+//
+// M2 时迭代器挂的只是一堆读取器指针，Close 没有实际作用；M3 引入 Compaction 之后，
+// 不释放引用就意味着"被合并掉的文件永远删不掉"。接口里早就有 Close，
+// 到这一步它才真正变成必需调用 —— 这正是当初把它放进接口的理由。
+type versionedIterator struct {
+	// 内嵌具体类型而不是 iterator.Iterator 接口：Close 只存在于 DBIter 上，
+	// 不在那个接口里，内嵌接口的话就没法调用它。
+	*iterator.DBIter
+
+	db     *DB
+	v      *version.Version
+	closed bool
+}
+
+// Close 释放迭代器。重复调用是安全的。
+func (it *versionedIterator) Close() error {
+	if it.closed {
+		return nil
+	}
+	it.closed = true
+	err := it.DBIter.Close()
+	it.db.releaseVersion(it.v)
+	it.v = nil
+	return err
 }
 
 // Snapshot 是一个固定的序列号视图：用它读到的永远是"取快照那一刻"的数据，
 // 之后写入的新数据对它不可见。
 //
-// M2 只提供读侧能力。释放序列号（让 Compaction 能安全地丢掉更旧的版本）
-// 属于 M4 的工作，所以 Release 目前只是把快照标记为失效。
+// 快照本身不复制任何数据，但它会让 Compaction 保留它还需要读的那些旧版本，
+// 所以它必须被 Release。忘记 Release 不会读出错数据，只会让磁盘上的旧版本
+// 清理得晚一些。
 type Snapshot struct {
 	db       *DB
 	seq      uint64
-	released bool
+	released atomic.Bool
 }
 
 // GetSnapshot 记录当前已提交的最大序列号并返回一个快照。
 //
 // 取快照本身几乎零成本：它只记下一个序列号，不复制任何数据，也不阻塞写入。
 func (db *DB) GetSnapshot() *Snapshot {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return &Snapshot{db: db, seq: db.lastSeq}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s := &Snapshot{db: db, seq: db.lastSeq}
+	if !db.closed {
+		db.registerSnapshotLocked(db.lastSeq)
+	}
+	return s
 }
 
 // Seq 返回快照固定的序列号。
@@ -122,7 +185,7 @@ func (s *Snapshot) Get(userKey []byte) ([]byte, error) {
 	if db.closed {
 		return nil, ErrClosed
 	}
-	if s.released {
+	if s.released.Load() {
 		return nil, ErrSnapshotReleased
 	}
 	v, err := db.getLocked(s.seq, userKey)
@@ -140,17 +203,21 @@ func (s *Snapshot) NewIterator(opt *IteratorOptions) Iterator {
 	if db.closed {
 		return errIterator{err: ErrClosed}
 	}
-	if s.released {
+	if s.released.Load() {
 		return errIterator{err: ErrSnapshotReleased}
 	}
 	return db.newIteratorLocked(s.seq, opt)
 }
 
-// Release 使快照失效。重复调用是安全的。
+// Release 使快照失效，并把它从"存活快照"里注销。重复调用是安全的。
 //
-// 快照不影响写入，也不占用内存，所以"忘记 Release"目前不会造成任何泄漏；
-// 一旦 M4 开始回收序列号，忘记 Release 会推迟旧版本的清理，那时它才会变成必需动作。
-func (s *Snapshot) Release() { s.released = true }
+// 注销之后 Compaction 才敢丢掉这个序列号之前的旧版本。不调用也不会读出错数据，
+// 只是旧版本会一直留在磁盘上（直到进程退出）。
+func (s *Snapshot) Release() {
+	if s.released.CompareAndSwap(false, true) {
+		s.db.releaseSnapshot(s.seq)
+	}
+}
 
 // copyValue 复制一份值，把"指向块缓存/跳表节点内部的切片"挡在包的边界之内。
 //
@@ -177,3 +244,15 @@ func (e errIterator) Value() []byte { return nil }
 func (e errIterator) Next()         {}
 func (e errIterator) Error() error  { return e.err }
 func (e errIterator) Close() error  { return nil }
+
+// errorSource 是一个"一条记录都没有、但带着错误"的 internal 迭代器，
+// 供 MergingIterator 把内部缺陷传播到上层。
+type errorSource struct{ err error }
+
+func (e errorSource) SeekToFirst()  {}
+func (e errorSource) Seek([]byte)   {}
+func (e errorSource) Valid() bool   { return false }
+func (e errorSource) Key() []byte   { return nil }
+func (e errorSource) Value() []byte { return nil }
+func (e errorSource) Next()         {}
+func (e errorSource) Error() error  { return e.err }

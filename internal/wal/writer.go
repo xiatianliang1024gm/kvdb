@@ -75,6 +75,13 @@ func NewWriter(dst io.Writer) *Writer {
 // Written 返回累计写入的字节数。
 func (w *Writer) Written() int64 { return w.written }
 
+// Append 把 record 按需拆成若干物理记录追加写入。
+//
+// 它是 addRecord 的导出形式，供复用这套记录格式的调用方使用 ——
+// M3 的 Manifest 就是一串同样格式的记录，理由见 internal/version 的包注释：
+// 崩溃恢复要处理的形态完全一样，没必要再写第二套。
+func (w *Writer) Append(record []byte) error { return w.addRecord(record) }
+
 // addRecord 把 record 按需拆成若干物理记录追加写入。
 func (w *Writer) addRecord(record []byte) error {
 	left := record
