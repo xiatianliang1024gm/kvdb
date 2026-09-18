@@ -16,12 +16,30 @@ internal/ 下按模块切分 key / memdb / wal / sst / filter / cache / version 
 - M2 读优化：**已完成**（2026-09-18）
 - M3 写优化：**已完成**（2026-09-18）
 - M4 一致性：**已完成**（2026-09-18）
-- M5 生产化：未开始
+- M5 生产化：**已完成**（2026-09-18，commit `8cba746`）—— 全部里程碑完成
 
 ## git
-已 init。基线 `6a375c1`（M0+M1+M2），`683e9c3`（M3），`1de8952`（M4）。
+已 init。基线 `6a375c1`（M0+M1+M2），`683e9c3`（M3），`1de8952`（M4），`8cba746`（M5）。
 中文 commit message 用 Write 写进 `_commitmsg.log` 再 `git commit -F`（`/_*.log` 已被忽略）。
 Bash 工具能跑 git 本身，但**别接管道**（coreutils 缺失）。
+
+## M5 确立的实现约定
+- 压缩按**块独立**判断：`worthCompressing = out <= raw - raw/8`，压不划算的块（过滤器/
+  索引/高熵）自动原样存；块缓存存**解压后**内容，`Decompressions` 与命中率互为印证
+- 限流（internal/rate 令牌桶）：Compaction 的**读和写都计费**、按 256KB 粒度；
+  nil 接收者=不限流；`Close` 放行等待者不报错（软约束）
+- `removeObsoleteLogsLocked` 删除失败**降级为警告**（Windows 杀毒/索引服务会短暂占用
+  刚被读过的文件；判据单调下次 Flush 重试）。这条是 M5 唯一放宽的行为
+- `DB.Checkpoint`：版本 + WAL 尾巴下界 + `SnapshotEdit()` 必须在**同一个 db.mu.RLock
+  临界区**捕获；复制 WAL 前**先 `db.log.Flush()`**（SyncWrites=false 时记录在 bufio 里）；
+  SST 优先硬链接；副本 Manifest 编号 = 源 nextFileNum，`edit.NextFileNum` 再自增防自撞；
+  撕裂 WAL 尾巴由副本恢复路径处理，无需停止世界
+- Options.Compression：0=默认（Snappy）而非关闭，显式关闭用 `CompressionNone`(-1)；
+  DefaultOptions 直接给 Snappy，保证能直接过 Validate
+- 事件日志三档：用户 `Options.Logger` > 数据目录 LOG 文件（轮转）> 丢弃；日志失败不停库
+- bench：`-mode ycsb|compress|checkpoint` + `-report` 追加 markdown 到 docs/BENCH.md；
+  YCSB 默认 MemTable 64MB 时 10 万 key 不落盘，要看到 Flush/Compaction 得调
+  `-memtable-size` / `-l0-trigger` / `-level-base-size`
 
 ## M4 确立的实现约定
 - 写队列用**自己的一把锁 `wmu`**，不复用 `db.mu`：`db.mu` 保护全局状态，
@@ -115,3 +133,8 @@ Bash 工具能跑 git 本身，但**别接管道**（coreutils 缺失）。
   上述整套环境知识已固化为用户级 skill `~/.workbuddy/skills/win-go-cgo-race/`（含通用版脚本），跨项目可用
 - Go 1.27.1（`C:\Program Files\Go\bin\go.exe`）；删除文件受 safe-delete 沙箱限制，偶尔拒删，可直接把临时文件加进 .gitignore。
   仓库已 init（见上"## git"）。
+- **Bash 工具的 heredoc / `python -c` 会把 `\\n` 转义成真换行**（工具层干扰），带转义的
+  复杂文本生成一律用 Write 写成 .py 脚本再执行（脚本里用 raw string）。另外 **Edit 工具
+  偶尔与磁盘状态不同步**（报成功但 grep 不到），编辑后必须 grep 复核；偶发 EBUSY 重试即可。
+- **`scripts/gotest-race.sh` 自己会写 `_race.log`**：外面再 `> _race.log` 重定向会双写互踩，
+  日志被刷成上千万行重复。要重定向就换文件名。
