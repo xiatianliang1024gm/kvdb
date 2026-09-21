@@ -110,11 +110,15 @@ func (b *WriteBatch) EncodeTo(dst []byte) []byte {
 	return append(dst, b.data...)
 }
 
-// Range 按序把批次里的每条记录交给 fn，序列号从 start 起逐条递增。
+// rangeRecords 按序把批次里的每条记录交给 fn，序列号从 start 起逐条递增。
 //
 // fn 返回 false 时停止遍历。正常构造（或经 decodeBatch 校验）的批次不会解析失败，
 // 返回 error 只是为了让损坏数据不至于被静默吞掉。
-func (b *WriteBatch) Range(start uint64, fn func(seq uint64, kind key.Kind, userKey, value []byte) bool) error {
+//
+// 它之所以不导出：回调签名里的 key.Kind 来自 internal 包，包外既 import 不到
+// kvdb/internal/key，也就写不出这个函数字面量 —— 导出等于给了一个用不了的
+// 方法。所有调用点（组提交落库、WAL 重放、单测）都在包内。
+func (b *WriteBatch) rangeRecords(start uint64, fn func(seq uint64, kind key.Kind, userKey, value []byte) bool) error {
 	seq := start
 	rest := b.data
 	for i := 0; i < b.count; i++ {

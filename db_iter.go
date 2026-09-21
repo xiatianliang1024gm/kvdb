@@ -149,10 +149,31 @@ func (it *versionedIterator) Close() error {
 // Snapshot 是一个固定的序列号视图：用它读到的永远是"取快照那一刻"的数据，
 // 之后写入的新数据对它不可见。
 //
+// 它定义成接口而不是结构体，理由只有一个：结构体版本的字段全是非导出的，
+// 包外造不出一个 *Snapshot，于是任何想替换 kvdb 实现的调用方（测试里的假库、
+// 包一层缓存/加密的装饰器）走到 GetSnapshot 就断了。换成接口之后，
+// "读最新视图"的 *DB 与"读固定视图"的快照在调用方眼里是同一种东西 ——
+// 两者都满足 Reader。
+//
 // 快照本身不复制任何数据，但它会让 Compaction 保留它还需要读的那些旧版本，
 // 所以它必须被 Release。忘记 Release 不会读出错数据，只会让磁盘上的旧版本
 // 清理得晚一些。
-type Snapshot struct {
+type Snapshot interface {
+	// Seq 返回快照固定的序列号。
+	Seq() uint64
+	// Get 读取快照时刻的可见版本；key 不存在或当时已被删除时返回 ErrNotFound。
+	Get(userKey []byte) ([]byte, error)
+	// NewIterator 返回一个遍历快照视图的迭代器。
+	NewIterator(opt *IteratorOptions) Iterator
+	// Release 使快照失效，并把它从"存活快照"里注销。重复调用是安全的。
+	//
+	// 注销之后 Compaction 才敢丢掉这个序列号之前的旧版本。不调用也不会读出错数据，
+	// 只是旧版本会一直留在磁盘上（直到进程退出）。
+	Release()
+}
+
+// snapshot 是 Snapshot 的唯一实现。
+type snapshot struct {
 	db       *DB
 	seq      uint64
 	released atomic.Bool
@@ -161,10 +182,10 @@ type Snapshot struct {
 // GetSnapshot 记录当前已提交的最大序列号并返回一个快照。
 //
 // 取快照本身几乎零成本：它只记下一个序列号，不复制任何数据，也不阻塞写入。
-func (db *DB) GetSnapshot() *Snapshot {
+func (db *DB) GetSnapshot() Snapshot {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	s := &Snapshot{db: db, seq: db.lastSeq}
+	s := &snapshot{db: db, seq: db.lastSeq}
 	if !db.closed {
 		db.registerSnapshotLocked(db.lastSeq)
 	}
@@ -172,10 +193,10 @@ func (db *DB) GetSnapshot() *Snapshot {
 }
 
 // Seq 返回快照固定的序列号。
-func (s *Snapshot) Seq() uint64 { return s.seq }
+func (s *snapshot) Seq() uint64 { return s.seq }
 
 // Get 读取快照时刻的可见版本；key 不存在或当时已被删除时返回 ErrNotFound。
-func (s *Snapshot) Get(userKey []byte) ([]byte, error) {
+func (s *snapshot) Get(userKey []byte) ([]byte, error) {
 	if len(userKey) == 0 {
 		return nil, ErrEmptyKey
 	}
@@ -196,7 +217,7 @@ func (s *Snapshot) Get(userKey []byte) ([]byte, error) {
 }
 
 // NewIterator 返回一个遍历快照视图的迭代器。
-func (s *Snapshot) NewIterator(opt *IteratorOptions) Iterator {
+func (s *snapshot) NewIterator(opt *IteratorOptions) Iterator {
 	db := s.db
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -210,10 +231,7 @@ func (s *Snapshot) NewIterator(opt *IteratorOptions) Iterator {
 }
 
 // Release 使快照失效，并把它从"存活快照"里注销。重复调用是安全的。
-//
-// 注销之后 Compaction 才敢丢掉这个序列号之前的旧版本。不调用也不会读出错数据，
-// 只是旧版本会一直留在磁盘上（直到进程退出）。
-func (s *Snapshot) Release() {
+func (s *snapshot) Release() {
 	if s.released.CompareAndSwap(false, true) {
 		s.db.releaseSnapshot(s.seq)
 	}

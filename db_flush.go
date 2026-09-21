@@ -178,7 +178,7 @@ func (db *DB) applyBatch(record []byte) error {
 		return nil
 	}
 	seq := b.Sequence()
-	if err := b.Range(seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
+	if err := b.rangeRecords(seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
 		db.mem.Add(seq, kind, userKey, value)
 		return true
 	}); err != nil {

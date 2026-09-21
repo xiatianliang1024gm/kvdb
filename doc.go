@@ -46,6 +46,20 @@
 // 的有序迭代器。它持有构造那一刻的版本引用，因此读的那批文件在关闭之前不会被
 // Compaction 删掉 —— 这也是 Close 必须调用的原因。
 //
+// # 对外契约
+//
+// api.go 把 DB 的方法收成三个接口，想知道"这个库能干什么"看那一个文件就够了：
+//
+//   - Reader：Get / NewIterator。*DB（最新视图）与 Snapshot（固定视图）都实现它
+//   - Writer：Put / Delete / Write。Write 是唯一写入口，另两个是它的语法糖
+//   - Store：Reader + Writer + Close
+//
+// 剩下的 Stats / RecoveryReport / Checkpoint / GetSnapshot 属于运维与生命周期，
+// 没有收进接口：它们绑死在具体实例上，抽象出来没有调用方受益。
+//
+// Open 返回具体类型 *DB 而不是接口，这是有意的 —— Go 的惯例是"接受接口、
+// 返回结构体"，这样以后给 DB 加方法不会打破任何调用方。
+//
 // # 已经具备的能力
 //
 //   - WAL：分块顺序追加、每条 CRC32C 校验、崩溃后重放、尾部损坏可容忍

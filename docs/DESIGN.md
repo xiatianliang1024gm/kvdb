@@ -436,7 +436,9 @@ func (b *WriteBatch) Sequence() uint64
 func (b *WriteBatch) SetSequence(seq uint64)
 func (b *WriteBatch) Encode() []byte
 func (b *WriteBatch) EncodeTo(dst []byte) []byte
-func (b *WriteBatch) Range(start uint64, fn func(seq uint64, kind key.Kind, k, v []byte) bool) error
+// 非导出：回调签名里的 key.Kind 来自 internal 包，包外 import 不到，
+// 导出等于给一个用不了的方法。见 api.go / batch.go 的注释。
+func (b *WriteBatch) rangeRecords(start uint64, fn func(seq uint64, kind key.Kind, k, v []byte) bool) error
 
 // ── package kvdb/internal/memdb
 func New(cmp key.Comparer, logNum uint64) *MemTable
@@ -582,7 +584,7 @@ SST 文件从线性数组改成可分块定位的结构"，因此**旧格式的 
 // ── package kvdb（db_iter.go）
 
 func (db *DB) NewIterator(opt *IteratorOptions) Iterator
-func (db *DB) GetSnapshot() *Snapshot
+func (db *DB) GetSnapshot() Snapshot
 
 type Iterator interface {          // 面向 user key 的只读有序迭代器，只支持前向
     SeekToFirst()
@@ -600,11 +602,14 @@ type IteratorOptions struct {
     UpperBound []byte              // 含；与 LevelDB 的 ReadOptions 一致，是闭区间
 }
 
-type Snapshot struct{ /* 只记一个序列号，不复制数据、不阻塞写入 */ }
-func (s *Snapshot) Seq() uint64
-func (s *Snapshot) Get(userKey []byte) ([]byte, error)
-func (s *Snapshot) NewIterator(opt *IteratorOptions) Iterator
-func (s *Snapshot) Release()       // M2 只是标记失效；序列号回收是 M4 的事
+// Snapshot 是接口而非结构体：struct 版字段全非导出，包外造不出 *Snapshot，
+// 于是"替换实现"这件事走到 GetSnapshot 就断了。见 api.go。
+type Snapshot interface {          /* 只记一个序列号，不复制数据、不阻塞写入 */
+    Seq() uint64
+    Get(userKey []byte) ([]byte, error)
+    NewIterator(opt *IteratorOptions) Iterator
+    Release()                      // M2 只是标记失效；序列号回收是 M4 的事
+}
 
 // Stats 新增的读路径指标
 //   CacheHits / CacheMisses / CacheBytes / CacheItems
@@ -1310,10 +1315,14 @@ type DB interface {
     Delete(key []byte) error
     Write(batch *WriteBatch) error
     NewIterator(opt *IteratorOptions) Iterator
-    GetSnapshot() *Snapshot
+    GetSnapshot() Snapshot
     Close() error
 }
 ```
+
+> 附录 B 里的这个 `DB interface` 是**能力清单**，不是代码里的类型：`Open` 返回的是
+> 具体类型 `*DB`（Go 惯例：接受接口、返回结构体）。真正声明出来的是 `api.go` 里的
+> `Reader` / `Writer` / `Store` 三个接口，DB 与 Snapshot 都满足 `Reader`。
 
 `Get` / `Put` / `Delete` 都是 `WriteBatch` 的语法糖。真正的写入口只有 `Write`，这样原子性、Group Commit、WAL 追加都只需要在一个地方实现。
 

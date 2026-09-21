@@ -226,7 +226,7 @@ func (db *DB) applyWriteGroup(group []*writeRequest, firstSeq, lastSeq uint64, w
 	}
 
 	for _, r := range group {
-		if err := r.batch.Range(r.seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
+		if err := r.batch.rangeRecords(r.seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
 			db.mem.Add(seq, kind, userKey, value)
 			return true
 		}); err != nil {

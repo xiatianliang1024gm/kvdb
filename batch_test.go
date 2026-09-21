@@ -70,11 +70,11 @@ func TestWriteBatchDecodeRoundTrip(t *testing.T) {
 		k, v string
 	}
 	var got []rec
-	if err := decoded.Range(decoded.Sequence(), func(seq uint64, kind key.Kind, k, v []byte) bool {
+	if err := decoded.rangeRecords(decoded.Sequence(), func(seq uint64, kind key.Kind, k, v []byte) bool {
 		got = append(got, rec{seq, kind, string(k), string(v)})
 		return true
 	}); err != nil {
-		t.Fatalf("Range failed: %v", err)
+		t.Fatalf("rangeRecords failed: %v", err)
 	}
 	want := []rec{
 		{42, key.TypeValue, "k1", "v1"},
@@ -102,8 +102,8 @@ func TestWriteBatchRangeDoesNotMutate(t *testing.T) {
 	}
 	count := func() int {
 		n := 0
-		if err := b.Range(1, func(uint64, key.Kind, []byte, []byte) bool { n++; return true }); err != nil {
-			t.Fatalf("Range failed: %v", err)
+		if err := b.rangeRecords(1, func(uint64, key.Kind, []byte, []byte) bool { n++; return true }); err != nil {
+			t.Fatalf("rangeRecords failed: %v", err)
 		}
 		return n
 	}
@@ -123,7 +123,7 @@ func TestWriteBatchRangeEarlyStop(t *testing.T) {
 		}
 	}
 	n := 0
-	if err := b.Range(1, func(uint64, key.Kind, []byte, []byte) bool { n++; return false }); err != nil {
+	if err := b.rangeRecords(1, func(uint64, key.Kind, []byte, []byte) bool { n++; return false }); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
