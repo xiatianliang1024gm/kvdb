@@ -22,3 +22,4 @@ coverage.txt
 # WorkBuddy 的工作区数据（会话记录、memory 等），不进版本库
 /.workbuddy/
 docs/QUIZ.md
+docs/SELF-REVIEW.md
