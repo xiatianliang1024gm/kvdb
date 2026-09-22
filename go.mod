@@ -1,4 +1,4 @@
-module kvdb
+module github.com/xiatianliang1024gm/kvdb
 
 go 1.23
 

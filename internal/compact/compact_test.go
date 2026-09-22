@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"kvdb/internal/key"
-	"kvdb/internal/sst"
-	"kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/sst"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
 
 // ── 测试脚手架 ────────────────────────────────────────────────────

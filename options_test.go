@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 func TestDefaultOptionsIsValid(t *testing.T) {

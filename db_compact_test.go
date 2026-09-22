@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
 
 // 这个文件是 M3（写优化）的验收测试。

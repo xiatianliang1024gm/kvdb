@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"kvdb/internal/wal"
+	"github.com/xiatianliang1024gm/kvdb/internal/wal"
 )
 
 // Manifest 文件的命名与格式。

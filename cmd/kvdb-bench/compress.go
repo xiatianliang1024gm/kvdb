@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"kvdb"
+	"github.com/xiatianliang1024gm/kvdb"
 )
 
 type compressCase struct {

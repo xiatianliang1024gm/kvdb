@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // Data Block 与 Index Block 用的是同一种块编码（LevelDB 的 block 格式）：

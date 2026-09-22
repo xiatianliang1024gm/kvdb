@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // 写入批次的二进制布局（整数字段大端，与项目既有约定一致）：
@@ -116,7 +116,7 @@ func (b *WriteBatch) EncodeTo(dst []byte) []byte {
 // 返回 error 只是为了让损坏数据不至于被静默吞掉。
 //
 // 它之所以不导出：回调签名里的 key.Kind 来自 internal 包，包外既 import 不到
-// kvdb/internal/key，也就写不出这个函数字面量 —— 导出等于给了一个用不了的
+// github.com/xiatianliang1024gm/kvdb/internal/key，也就写不出这个函数字面量 —— 导出等于给了一个用不了的
 // 方法。所有调用点（组提交落库、WAL 重放、单测）都在包内。
 func (b *WriteBatch) rangeRecords(start uint64, fn func(seq uint64, kind key.Kind, userKey, value []byte) bool) error {
 	seq := start

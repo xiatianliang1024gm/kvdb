@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 func newTestMemTable() *MemTable { return New(testComparer{}, 7) }

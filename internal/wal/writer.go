@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 
-	"kvdb/internal/crc"
+	"github.com/xiatianliang1024gm/kvdb/internal/crc"
 )
 
 // 分块日志的物理布局（沿用 LevelDB 的 log 格式，只把整数字节序统一成大端）：

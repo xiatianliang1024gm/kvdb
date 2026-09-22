@@ -30,7 +30,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // ErrNotOpen 表示 VersionSet 还没有可追加的 Manifest。

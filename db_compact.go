@@ -6,9 +6,9 @@ import (
 	"math"
 	"os"
 
-	"kvdb/internal/compact"
-	"kvdb/internal/sst"
-	"kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/compact"
+	"github.com/xiatianliang1024gm/kvdb/internal/sst"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
 
 // errClosing 用于在关库过程中把后台任务的中断与真实的失败区分开。

@@ -3,7 +3,7 @@ package memdb
 import (
 	"sync/atomic"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // nodeOverhead 是每个跳表节点除 key/value 之外的粗略开销估计：

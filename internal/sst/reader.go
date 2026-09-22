@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 
-	"kvdb/internal/cache"
-	"kvdb/internal/compress"
-	"kvdb/internal/crc"
-	"kvdb/internal/filter"
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/cache"
+	"github.com/xiatianliang1024gm/kvdb/internal/compress"
+	"github.com/xiatianliang1024gm/kvdb/internal/crc"
+	"github.com/xiatianliang1024gm/kvdb/internal/filter"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // OpenOptions 收集打开一个 SSTable 时需要的读取侧依赖。
@@ -63,12 +63,12 @@ type Reader struct {
 func Open(path string, o OpenOptions) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("kvdb/sst: open %s: %w", path, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: open %s: %w", path, err)
 	}
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, fmt.Errorf("kvdb/sst: stat %s: %w", path, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: stat %s: %w", path, err)
 	}
 	size := info.Size()
 	if size < FooterLen {
@@ -78,7 +78,7 @@ func Open(path string, o OpenOptions) (*Reader, error) {
 	var footer [FooterLen]byte
 	if _, err := f.ReadAt(footer[:], size-FooterLen); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("kvdb/sst: read footer of %s: %w", path, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: read footer of %s: %w", path, err)
 	}
 	metaH, indexH, err := decodeFooter(footer[:])
 	if err != nil {
@@ -143,7 +143,7 @@ func (r *Reader) FilterEnabled() bool { return r.filter != nil }
 // Close 关闭文件句柄。
 func (r *Reader) Close() error {
 	if err := r.f.Close(); err != nil {
-		return fmt.Errorf("kvdb/sst: close %s: %w", r.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: close %s: %w", r.path, err)
 	}
 	return nil
 }
@@ -152,7 +152,7 @@ func (r *Reader) Close() error {
 func findFilterHandle(meta []byte) (blockHandle, bool, error) {
 	it, err := newBlockIter(meta, compareBytes)
 	if err != nil {
-		return blockHandle{}, false, fmt.Errorf("kvdb/sst: invalid metaindex block: %w", err)
+		return blockHandle{}, false, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: invalid metaindex block: %w", err)
 	}
 	want := filterMetaKey()
 	for it.SeekToFirst(); it.Valid(); it.Next() {
@@ -277,7 +277,7 @@ func (r *Reader) readBlock(h blockHandle) ([]byte, error) {
 
 	buf := make([]byte, h.size+BlockTrailerLen)
 	if _, err := r.f.ReadAt(buf, int64(h.offset)); err != nil {
-		return nil, fmt.Errorf("kvdb/sst: read block at %d of %s: %w", h.offset, r.path, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: read block at %d of %s: %w", h.offset, r.path, err)
 	}
 	trailer := buf[h.size:]
 	ctype := compress.Type(trailer[0])

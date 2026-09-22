@@ -8,13 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"kvdb/internal/cache"
-	"kvdb/internal/key"
-	"kvdb/internal/memdb"
-	"kvdb/internal/rate"
-	"kvdb/internal/sst"
-	"kvdb/internal/version"
-	"kvdb/internal/wal"
+	"github.com/xiatianliang1024gm/kvdb/internal/cache"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/memdb"
+	"github.com/xiatianliang1024gm/kvdb/internal/rate"
+	"github.com/xiatianliang1024gm/kvdb/internal/sst"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/wal"
 )
 
 var (

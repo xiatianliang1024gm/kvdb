@@ -5,12 +5,12 @@ import (
 	"os"
 	"sort"
 
-	"kvdb/internal/compress"
-	"kvdb/internal/iterator"
-	"kvdb/internal/key"
-	"kvdb/internal/rate"
-	"kvdb/internal/sst"
-	"kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/compress"
+	"github.com/xiatianliang1024gm/kvdb/internal/iterator"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/rate"
+	"github.com/xiatianliang1024gm/kvdb/internal/sst"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
 
 // rateChargeChunk 是限流计费的粒度：累计读写多少字节之后向限流器申请一次配额。
@@ -276,7 +276,7 @@ func inputIterators(c *Compaction, env Env, account *rateAccount) ([]iterator.It
 		for _, f := range group {
 			r, err := env.Reader(f.Num)
 			if err != nil {
-				return nil, fmt.Errorf("kvdb/compact: open input file %d: %w", f.Num, err)
+				return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/compact: open input file %d: %w", f.Num, err)
 			}
 			var it iterator.Iterator = r.NewIterator()
 			if account != nil && account.lim != nil {

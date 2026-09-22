@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"kvdb/internal/compress"
-	"kvdb/internal/filter"
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/compress"
+	"github.com/xiatianliang1024gm/kvdb/internal/filter"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // Suffix 是 SSTable 文件的扩展名。
@@ -97,23 +97,23 @@ var (
 	//
 	// 它是**可容忍**的：崩溃时写到一半的 Flush 没有 Footer，或者 Footer 只写了一半，
 	// 都会落到这个错误上，调用方应当丢弃该文件（数据仍在 WAL 里）。
-	ErrBadFooter = errors.New("kvdb/sst: bad footer")
+	ErrBadFooter = errors.New("github.com/xiatianliang1024gm/kvdb/sst: bad footer")
 
 	// ErrLegacyFormat 表示文件是 M1 的线性布局，与 M2 不兼容。
 	//
 	// 它**不可容忍**：这说明数据目录来自旧版本，静默丢弃会造成真实的数据损失，
 	// 必须让调用方明确报错而不是当损坏文件删掉。
-	ErrLegacyFormat = errors.New("kvdb/sst: unsupported sst format (M1 linear layout)")
+	ErrLegacyFormat = errors.New("github.com/xiatianliang1024gm/kvdb/sst: unsupported sst format (M1 linear layout)")
 
 	// ErrCorruptBlock 表示块 CRC 校验失败，或块/索引结构非法。
-	ErrCorruptBlock = errors.New("kvdb/sst: corrupt block")
+	ErrCorruptBlock = errors.New("github.com/xiatianliang1024gm/kvdb/sst: corrupt block")
 
 	// ErrUnsupportedCompression 表示块尾的类型字节本引擎不认识。
 	//
 	// 它**不可容忍**：把它当"未压缩"处理会把一段压缩流交给上层解析，
 	// 得到一堆看似合法、实际全是乱码的 key —— 静默的数据损坏。
 	// 这个错误通常意味着"文件来自更新的版本"，用户需要知道这一点。
-	ErrUnsupportedCompression = errors.New("kvdb/sst: unsupported block compression type")
+	ErrUnsupportedCompression = errors.New("github.com/xiatianliang1024gm/kvdb/sst: unsupported block compression type")
 )
 
 // BlockStats 汇总块压缩在读写两侧的规模。
@@ -219,7 +219,7 @@ func encodeFooter(meta, index blockHandle) [FooterLen]byte {
 	area = index.encode(area)
 	if len(area) > footerHandleArea {
 		// 两个 handle 各最多 20 字节，40 字节是硬上界，越界只可能是编码逻辑写错。
-		panic(fmt.Sprintf("kvdb/sst: footer handle area overflow (%d bytes)", len(area)))
+		panic(fmt.Sprintf("github.com/xiatianliang1024gm/kvdb/sst: footer handle area overflow (%d bytes)", len(area)))
 	}
 	copy(buf[:], area)
 	binary.BigEndian.PutUint64(buf[footerHandleArea:], magic)

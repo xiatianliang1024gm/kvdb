@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"time"
 
-	"kvdb"
+	"github.com/xiatianliang1024gm/kvdb"
 )
 
 func runCheckpointBench(cfg config) error {

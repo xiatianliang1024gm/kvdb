@@ -43,7 +43,7 @@ import (
 	"sync"
 	"time"
 
-	"kvdb"
+	"github.com/xiatianliang1024gm/kvdb"
 )
 
 func main() {

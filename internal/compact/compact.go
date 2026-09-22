@@ -16,8 +16,8 @@ package compact
 import (
 	"fmt"
 
-	"kvdb/internal/key"
-	"kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
 
 // LevelConfig 收集分层策略。

@@ -23,10 +23,10 @@ import (
 	"fmt"
 	"os"
 
-	"kvdb/internal/compress"
-	"kvdb/internal/crc"
-	"kvdb/internal/filter"
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/compress"
+	"github.com/xiatianliang1024gm/kvdb/internal/crc"
+	"github.com/xiatianliang1024gm/kvdb/internal/filter"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // WriterOptions 是写 SSTable 时的可选参数。
@@ -80,7 +80,7 @@ type Writer struct {
 func NewWriter(path string, cmp key.Comparer, opts WriterOptions) (*Writer, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("kvdb/sst: create %s: %w", path, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: create %s: %w", path, err)
 	}
 	if opts.BlockSize <= 0 {
 		opts.BlockSize = DefaultBlockSize
@@ -112,14 +112,14 @@ func NewWriter(path string, cmp key.Comparer, opts WriterOptions) (*Writer, erro
 // Add 追加一条记录。value 可以为空（墓碑）。
 func (w *Writer) Add(ik, value []byte) error {
 	if w.finished {
-		return errors.New("kvdb/sst: add to a finished writer")
+		return errors.New("github.com/xiatianliang1024gm/kvdb/sst: add to a finished writer")
 	}
 	if _, _, _, err := key.DecodeInternalKey(ik); err != nil {
 		return err
 	}
 	if w.count > 0 {
 		if c := w.icmp.Compare(ik, w.lastKey); c <= 0 {
-			return fmt.Errorf("kvdb/sst: keys must be added in strictly increasing order, got %s after %s",
+			return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: keys must be added in strictly increasing order, got %s after %s",
 				describeKey(ik), describeKey(w.lastKey))
 		}
 		// 切块的唯一时机：块已经够大，且下一条记录换了 user key。
@@ -208,10 +208,10 @@ func (w *Writer) writeRawBlock(contents []byte) (blockHandle, error) {
 	binary.BigEndian.PutUint32(trailer[1:], crc.ChecksumWithType(data, byte(ctype)))
 
 	if _, err := w.buf.Write(data); err != nil {
-		return blockHandle{}, fmt.Errorf("kvdb/sst: write block to %s: %w", w.path, err)
+		return blockHandle{}, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: write block to %s: %w", w.path, err)
 	}
 	if _, err := w.buf.Write(trailer[:]); err != nil {
-		return blockHandle{}, fmt.Errorf("kvdb/sst: write block trailer to %s: %w", w.path, err)
+		return blockHandle{}, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: write block trailer to %s: %w", w.path, err)
 	}
 	w.offset += int64(len(data)) + BlockTrailerLen
 
@@ -274,16 +274,16 @@ func (w *Writer) Finish() error {
 
 	footer := encodeFooter(metaHandle, indexHandle)
 	if _, err := w.buf.Write(footer[:]); err != nil {
-		return fmt.Errorf("kvdb/sst: write footer to %s: %w", w.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: write footer to %s: %w", w.path, err)
 	}
 	if err := w.buf.Flush(); err != nil {
-		return fmt.Errorf("kvdb/sst: flush %s: %w", w.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: flush %s: %w", w.path, err)
 	}
 	if err := w.f.Sync(); err != nil {
-		return fmt.Errorf("kvdb/sst: sync %s: %w", w.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: sync %s: %w", w.path, err)
 	}
 	if err := w.f.Close(); err != nil {
-		return fmt.Errorf("kvdb/sst: close %s: %w", w.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/sst: close %s: %w", w.path, err)
 	}
 	return nil
 }

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // 测试用的比较器：字节序，与 kvdb.BytewiseComparer 行为一致。

@@ -3,7 +3,7 @@ package version
 import (
 	"fmt"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // VersionEdit 描述一次版本变更：新增了哪些文件、删除了哪些文件，

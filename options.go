@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"kvdb/internal/compress"
-	"kvdb/internal/key"
-	"kvdb/internal/logger"
+	"github.com/xiatianliang1024gm/kvdb/internal/compress"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/logger"
 )
 
 // 默认配置，数值取自 docs/DESIGN.md 附录 A 的 Options 草图。

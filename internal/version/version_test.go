@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // ── 测试脚手架 ────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 package iterator
 
-import "kvdb/internal/key"
+import "github.com/xiatianliang1024gm/kvdb/internal/key"
 
 // MergingIterator 把多个按 internal key 升序的迭代器归并成一个有序流。
 //

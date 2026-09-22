@@ -1,6 +1,6 @@
 package iterator
 
-import "kvdb/internal/key"
+import "github.com/xiatianliang1024gm/kvdb/internal/key"
 
 // DBIter 在归并流之上呈现 user key 级别的有序视图。
 //

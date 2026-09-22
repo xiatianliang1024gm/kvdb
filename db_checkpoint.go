@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"kvdb/internal/sst"
-	"kvdb/internal/version"
-	"kvdb/internal/wal"
+	"github.com/xiatianliang1024gm/kvdb/internal/sst"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/wal"
 )
 
 // ErrCheckpointTargetNotEmpty 表示 Checkpoint 的目标目录非空。

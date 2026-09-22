@@ -16,7 +16,7 @@ const TrailerLen = 8
 const MaxSeqNum uint64 = (1 << 56) - 1
 
 // ErrCorruptInternalKey 表示 internal key 的尾缀缺失或类型字段非法。
-var ErrCorruptInternalKey = errors.New("kvdb/key: corrupt internal key")
+var ErrCorruptInternalKey = errors.New("github.com/xiatianliang1024gm/kvdb/key: corrupt internal key")
 
 // Kind 是 internal key 尾缀里的记录类型，占 1 字节。
 type Kind uint8
@@ -58,7 +58,7 @@ func (p ParsedInternalKey) String() string {
 // 静默截断会破坏排序前提，进而产生难以定位的数据错乱。
 func MakeTrailer(seq uint64, kind Kind) uint64 {
 	if seq > MaxSeqNum {
-		panic(fmt.Sprintf("kvdb/key: sequence number %d exceeds MaxSeqNum %d", seq, MaxSeqNum))
+		panic(fmt.Sprintf("github.com/xiatianliang1024gm/kvdb/key: sequence number %d exceeds MaxSeqNum %d", seq, MaxSeqNum))
 	}
 	return seq<<8 | uint64(kind)
 }

@@ -12,7 +12,7 @@ package iterator
 import (
 	"bytes"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // Iterator 是 internal key 级别的有序迭代器，只支持前向遍历。

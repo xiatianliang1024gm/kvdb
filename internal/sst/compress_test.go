@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"kvdb/internal/cache"
-	"kvdb/internal/compress"
-	"kvdb/internal/crc"
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/cache"
+	"github.com/xiatianliang1024gm/kvdb/internal/compress"
+	"github.com/xiatianliang1024gm/kvdb/internal/crc"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // 一份可压缩的 value：160 字节的高度重复内容，LSM 里的真实负载长这样

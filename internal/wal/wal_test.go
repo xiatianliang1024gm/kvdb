@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"testing"
 
-	"kvdb/internal/crc"
+	"github.com/xiatianliang1024gm/kvdb/internal/crc"
 )
 
 // writeAll 用 Writer 顺序写入若干记录并返回字节流。

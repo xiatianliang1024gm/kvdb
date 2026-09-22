@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"kvdb/internal/key"
-	"kvdb/internal/memdb"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/memdb"
 )
 
 type testComparer struct{}

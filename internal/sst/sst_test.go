@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kvdb/internal/cache"
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/cache"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 type testComparer struct{}

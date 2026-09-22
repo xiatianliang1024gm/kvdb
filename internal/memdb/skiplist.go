@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"sync/atomic"
 
-	"kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 )
 
 // MaxHeight 是跳表的最大层数。
@@ -108,7 +108,7 @@ func (s *Skiplist) Insert(ik, value []byte) {
 		prev[i] = s.head
 	}
 	if x := s.findGreaterOrEqual(ik, &prev); x != nil && s.cmp.Compare(x.key, ik) == 0 {
-		panic(fmt.Sprintf("kvdb/memdb: duplicate internal key %q", ik))
+		panic(fmt.Sprintf("github.com/xiatianliang1024gm/kvdb/memdb: duplicate internal key %q", ik))
 	}
 
 	height := s.randomHeight()

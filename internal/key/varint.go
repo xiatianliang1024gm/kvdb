@@ -20,11 +20,11 @@ const (
 
 var (
 	// ErrVarintTruncated 表示缓冲区在 varint 编码结束前就已耗尽。
-	ErrVarintTruncated = errors.New("kvdb/key: truncated varint")
+	ErrVarintTruncated = errors.New("github.com/xiatianliang1024gm/kvdb/key: truncated varint")
 	// ErrVarintOverflow 表示 varint 编码超过 64 位，无法用 uint64 表示。
-	ErrVarintOverflow = errors.New("kvdb/key: varint overflows 64 bits")
+	ErrVarintOverflow = errors.New("github.com/xiatianliang1024gm/kvdb/key: varint overflows 64 bits")
 	// ErrBufferTooSmall 表示读取定长编码时缓冲区长度不足。
-	ErrBufferTooSmall = errors.New("kvdb/key: buffer too small")
+	ErrBufferTooSmall = errors.New("github.com/xiatianliang1024gm/kvdb/key: buffer too small")
 )
 
 // PutUvarint 将 x 的 uvarint 编码追加到 dst 末尾并返回扩展后的切片。

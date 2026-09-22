@@ -45,7 +45,7 @@ func Create(dir string, num uint64) (*Log, error) {
 	path := LogName(dir, num)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("kvdb/wal: create %s: %w", path, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: create %s: %w", path, err)
 	}
 	buf := bufio.NewWriterSize(f, 2*BlockSize)
 	return &Log{
@@ -72,7 +72,7 @@ func (l *Log) Append(record []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return errors.New("kvdb/wal: append to a closed log")
+		return errors.New("github.com/xiatianliang1024gm/kvdb/wal: append to a closed log")
 	}
 	return l.w.addRecord(record)
 }
@@ -82,7 +82,7 @@ func (l *Log) Flush() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return errors.New("kvdb/wal: flush a closed log")
+		return errors.New("github.com/xiatianliang1024gm/kvdb/wal: flush a closed log")
 	}
 	return l.buf.Flush()
 }
@@ -92,13 +92,13 @@ func (l *Log) Sync() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return errors.New("kvdb/wal: sync a closed log")
+		return errors.New("github.com/xiatianliang1024gm/kvdb/wal: sync a closed log")
 	}
 	if err := l.buf.Flush(); err != nil {
-		return fmt.Errorf("kvdb/wal: flush %s: %w", l.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: flush %s: %w", l.path, err)
 	}
 	if err := l.file.Sync(); err != nil {
-		return fmt.Errorf("kvdb/wal: sync %s: %w", l.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: sync %s: %w", l.path, err)
 	}
 	return nil
 }
@@ -116,7 +116,7 @@ func (l *Log) Close() error {
 		err = cerr
 	}
 	if err != nil {
-		return fmt.Errorf("kvdb/wal: close %s: %w", l.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: close %s: %w", l.path, err)
 	}
 	return nil
 }
@@ -127,7 +127,7 @@ func (l *Log) Remove() error {
 		return err
 	}
 	if err := os.Remove(l.path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("kvdb/wal: remove %s: %w", l.path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: remove %s: %w", l.path, err)
 	}
 	return nil
 }
@@ -155,7 +155,7 @@ func Replay(dir string, num uint64, fn func(record []byte) error) (ReplayResult,
 	path := LogName(dir, num)
 	f, err := os.Open(path)
 	if err != nil {
-		return res, fmt.Errorf("kvdb/wal: open %s: %w", path, err)
+		return res, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: open %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -172,7 +172,7 @@ func Replay(dir string, num uint64, fn func(record []byte) error) (ReplayResult,
 				res.Corrupt = err
 				return res, nil
 			}
-			return res, fmt.Errorf("kvdb/wal: read %s: %w", path, err)
+			return res, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: read %s: %w", path, err)
 		}
 		if err := fn(record); err != nil {
 			return res, err
@@ -186,7 +186,7 @@ func Replay(dir string, num uint64, fn func(record []byte) error) (ReplayResult,
 func ListLogs(dir string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("kvdb/wal: read dir %s: %w", dir, err)
+		return nil, fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: read dir %s: %w", dir, err)
 	}
 	var nums []uint64
 	for _, e := range entries {
@@ -208,7 +208,7 @@ func ListLogs(dir string) ([]uint64, error) {
 func RemoveLog(dir string, num uint64) error {
 	path := LogName(dir, num)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("kvdb/wal: remove %s: %w", path, err)
+		return fmt.Errorf("github.com/xiatianliang1024gm/kvdb/wal: remove %s: %w", path, err)
 	}
 	return nil
 }

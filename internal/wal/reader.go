@@ -18,7 +18,7 @@ type ErrCorruptRecord struct {
 }
 
 func (e *ErrCorruptRecord) Error() string {
-	return fmt.Sprintf("kvdb/wal: corrupt record at offset %d: %s", e.Offset, e.Reason)
+	return fmt.Sprintf("github.com/xiatianliang1024gm/kvdb/wal: corrupt record at offset %d: %s", e.Offset, e.Reason)
 }
 
 // Reader 按记录边界读回日志。

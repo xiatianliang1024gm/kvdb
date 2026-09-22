@@ -51,13 +51,19 @@ go test -race ./...                             # 竞态检测（需 cgo）
 go run ./cmd/kvdb-bench -mode ycsb -workload A  # 跑一份 YCSB 压测
 ```
 
+在别的项目里当依赖用：
+
+```bash
+go get github.com/xiatianliang1024gm/kvdb
+```
+
 ```go
 package main
 
 import (
     "fmt"
 
-    "kvdb"
+    "github.com/xiatianliang1024gm/kvdb"
 )
 
 func main() {
@@ -99,9 +105,6 @@ func main() {
     fmt.Println(st.Levels, st.WriteBatches/st.WriteGroups, st.Compression.RawBytes)
 }
 ```
-
-> **模块路径提示**：`go.mod` 里的模块名是 `kvdb`（本地项目名）。放到 GitHub 上供他人引用前，
-> 建议执行 `go mod edit -module github.com/<你的账号>/kvdb`，或在引用方用 `replace` 指令指过去。
 
 ---
 

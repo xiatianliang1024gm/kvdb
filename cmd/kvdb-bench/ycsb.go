@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"kvdb"
+	"github.com/xiatianliang1024gm/kvdb"
 )
 
 // workloadSpec 是一种 YCSB 负载的读写配比。

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"runtime"
 
-	"kvdb/internal/key"
-	"kvdb/internal/wal"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/wal"
 )
 
 // 这个文件是 M4 的核心：**组提交（Group Commit）**。

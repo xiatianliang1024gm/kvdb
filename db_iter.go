@@ -4,8 +4,8 @@ import (
 	"errors"
 	"sync/atomic"
 
-	"kvdb/internal/iterator"
-	"kvdb/internal/version"
+	"github.com/xiatianliang1024gm/kvdb/internal/iterator"
+	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
 
 // ErrSnapshotReleased 表示快照已经被 Release 之后又被使用。
