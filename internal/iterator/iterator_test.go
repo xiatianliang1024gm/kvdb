@@ -158,7 +158,7 @@ func TestDBIterVisibility(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			it := NewDBIter(icmp, NewMerging(icmp, newest, middle, oldest), c.snapshot, nil, nil, nil)
+			it := NewDBIter(icmp, NewMerging(icmp, newest, middle, oldest), c.snapshot, nil, nil, nil, nil)
 			defer it.Close()
 
 			got := map[string]string{}
@@ -210,7 +210,7 @@ func TestDBIterSeek(t *testing.T) {
 		{"b", 2, ""},   // 快照 2 时 b 还没有墓碑，但 b 也没有数据版本
 	}
 	for _, c := range cases {
-		it := NewDBIter(icmp, NewMerging(icmp, newest, middle), c.snapshot, nil, nil, nil)
+		it := NewDBIter(icmp, NewMerging(icmp, newest, middle), c.snapshot, nil, nil, nil, nil)
 		it.Seek([]byte(c.target))
 		got := ""
 		if it.Valid() {
@@ -241,7 +241,7 @@ func TestDBIterBounds(t *testing.T) {
 		if upper != "" {
 			up = []byte(upper)
 		}
-		it := NewDBIter(icmp, NewMerging(icmp, children...), 100, lo, up, nil)
+		it := NewDBIter(icmp, NewMerging(icmp, children...), 100, lo, up, nil, nil)
 		defer it.Close()
 		var got []string
 		if seek == "" {
@@ -285,7 +285,7 @@ func TestDBIterNextSkipsOlderVersions(t *testing.T) {
 		rec{"a", 8, key.TypeValue, "a8"},
 		rec{"b", 7, key.TypeValue, "b7"},
 	)}
-	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil, nil)
+	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil, nil, nil)
 	defer it.Close()
 
 	it.SeekToFirst()
@@ -308,7 +308,7 @@ func TestDBIterKeyStabilityAndClose(t *testing.T) {
 		rec{"alpha", 2, key.TypeValue, "v1"},
 		rec{"beta", 1, key.TypeValue, "v2"},
 	)}
-	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil, nil)
+	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil, nil, nil)
 	it.SeekToFirst()
 
 	first := it.Key()

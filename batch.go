@@ -49,6 +49,10 @@ type WriteBatch struct {
 	seq   uint64 // 起始序列号，由 DB 在写入前赋值
 	count int    // 记录条数
 	data  []byte // 记录区，不含头部
+	// hasMerge 表示批次里含 merge 记录（M8）。DB.Write 用它在写入前拒绝
+	// "没配 MergeOperator 却写 operand"的调用——那种数据一旦落盘，读路径
+	// 就再也折不回来。O(1) 标记位，不需要在 Write 时扫描整个批次。
+	hasMerge bool
 }
 
 // NewWriteBatch 创建一个空批次。
@@ -69,6 +73,7 @@ func (b *WriteBatch) SetSequence(seq uint64) { b.seq = seq }
 func (b *WriteBatch) Reset() {
 	b.seq = 0
 	b.count = 0
+	b.hasMerge = false
 	b.data = b.data[:0]
 }
 
@@ -107,6 +112,19 @@ func (b *WriteBatch) DeleteRange(start, end []byte) error {
 	return b.addRecord(key.TypeRangeDeletion, start, end)
 }
 
+// Merge 追加一条 merge operand（M8）。
+//
+// 它写入的是 TypeMerge 记录，value 就是 operand 本身。operand 的语义完全由
+// Options.MergeOperator 解释：读的时候引擎把同 key 的 operand 链收集齐交给
+// FullMerge 折叠，稳态下 Compaction 会把它们折回一条 Value。
+//
+// 注意 Merge 与 Put 的区别：Merge 不覆盖旧值，而是"叠加"在旧值之上；
+// 同一批次里对同一个 key 先 Merge 再 Put 是合法的，语义按记录顺序生效。
+func (b *WriteBatch) Merge(userKey, operand []byte) error {
+	b.hasMerge = true
+	return b.addRecord(key.TypeMerge, userKey, operand)
+}
+
 // addRecord 把一条记录追加到记录区。
 func (b *WriteBatch) addRecord(kind key.Kind, userKey, value []byte) error {
 	if len(userKey) == 0 {
@@ -128,9 +146,10 @@ func (b *WriteBatch) addRecord(kind key.Kind, userKey, value []byte) error {
 
 // hasValue 表示该记录类型的编码里是否带 value 字段。
 //
-// 范围墓碑是"非 Value 记录也带 value"的唯一一种：value 存的是区间终点 End。
+// 范围墓碑是"非 Value 记录也带 value"的第一种：value 存的是区间终点 End。
+// Merge 是第二种：value 存的是 operand 本身（M8）。
 func hasValue(kind key.Kind) bool {
-	return kind == key.TypeValue || kind == key.TypeRangeDeletion
+	return kind == key.TypeValue || kind == key.TypeRangeDeletion || kind == key.TypeMerge
 }
 
 // Encode 返回批次的完整编码（头部 + 记录区）。
@@ -212,7 +231,7 @@ func decodeBatch(rep []byte) (*WriteBatch, error) {
 			return nil, fmt.Errorf("%w: record %d/%d missing", ErrBatchCorrupt, i+1, count)
 		}
 		kind := key.Kind(rest[0])
-		if kind != key.TypeValue && kind != key.TypeDeletion && kind != key.TypeRangeDeletion {
+		if kind != key.TypeValue && kind != key.TypeDeletion && kind != key.TypeMerge && kind != key.TypeRangeDeletion {
 			return nil, fmt.Errorf("%w: unknown kind %d", ErrBatchCorrupt, uint8(kind))
 		}
 		klen, n, err := key.Uvarint(rest[1:])

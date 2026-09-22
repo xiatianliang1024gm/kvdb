@@ -405,6 +405,7 @@ func Open(opts Options) (*DB, error) {
 			Comparer:   opts.Comparer,
 			MaxLevels:  opts.MaxLevels,
 			FilterName: compactionFilterName(opts.CompactionFilter),
+			MergeName:  mergeOperatorName(opts.MergeOperator),
 		}),
 		readers:     make(map[uint64]*sst.Reader),
 		snapshots:   make(map[uint64]int),
@@ -631,30 +632,42 @@ func (db *DB) Get(userKey []byte) ([]byte, error) {
 	return copyValue(v), nil
 }
 
-// getLocked 在指定快照下按"从新到旧"的顺序查找。
+// getLocked 在指定快照下读取 userKey 的可见值。
+//
+// 先定位最新可见版本（seekVisibleLocked，快速路径不付任何额外代价），
+// 命中 TypeMerge 时再向下收集全部 operand 并折叠（M8）。
+func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
+	val, kind, seq, err := db.seekVisibleLocked(snapshot, userKey)
+	if err != nil {
+		return nil, err
+	}
+	// 命中之后还有最后一道判据（M7）：**范围墓碑遮蔽**。命中的版本若落在某条
+	// 范围删除的区间内、且比它旧（seq < T.Seq <= snapshot），整个 key 对这个
+	// 快照不可见——同 key 更旧的版本必然也被遮蔽，不用继续下探，直接 NotFound。
+	if db.v.RangeCovers(userKey, seq, snapshot) {
+		return nil, ErrNotFound
+	}
+	if kind == key.TypeMerge {
+		return db.foldMergeLocked(snapshot, userKey, seq, val)
+	}
+	return valueOf(val, kind)
+}
+
+// seekVisibleLocked 在指定快照下按"从新到旧"的顺序查找最新可见版本。
 //
 // 顺序不能乱：MemTable 里的数据一定比 Immutable 新，Immutable 一定比任何
 // SST 新；SST 之间先看 L0（从新到旧），再看 L1 以下（每层最多一个候选）。
-// 第一个命中的层次（哪怕是墓碑）就是答案。
+// 第一个命中的层次（哪怕是墓碑或 merge 记录）就是答案。
 //
-// 命中之后还有最后一道判据（M7）：**范围墓碑遮蔽**。命中的版本若落在某条
-// 范围删除的区间内、且比它旧（seq < T.Seq <= snapshot），整个 key 对这个
-// 快照不可见——同 key 更旧的版本必然也被遮蔽，不用继续下探，直接 NotFound。
-//
-// 返回的切片由内部缓冲区持有，调用方不得修改。
-func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
+// 它不做范围遮蔽判定、不处理 Merge 折叠——那是 getLocked 的事。返回的
+// 切片由内部缓冲区持有，调用方不得修改。
+func (db *DB) seekVisibleLocked(snapshot uint64, userKey []byte) (value []byte, kind key.Kind, seq uint64, err error) {
 	if val, kind, seq, found := db.mem.Get(snapshot, userKey); found {
-		if db.v.RangeCovers(userKey, seq, snapshot) {
-			return nil, ErrNotFound
-		}
-		return valueOf(val, kind)
+		return val, kind, seq, nil
 	}
 	if db.imm != nil {
 		if val, kind, seq, found := db.imm.Get(snapshot, userKey); found {
-			if db.v.RangeCovers(userKey, seq, snapshot) {
-				return nil, ErrNotFound
-			}
-			return valueOf(val, kind)
+			return val, kind, seq, nil
 		}
 	}
 
@@ -664,13 +677,10 @@ func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
 	for i := len(l0) - 1; i >= 0; i-- {
 		val, kind, seq, found, err := db.probeFile(l0[i].Num, snapshot, userKey)
 		if err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
 		if found {
-			if v.RangeCovers(userKey, seq, snapshot) {
-				return nil, ErrNotFound
-			}
-			return valueOf(val, kind)
+			return val, kind, seq, nil
 		}
 	}
 	// L1 以下同层不重叠，每层二分一次就能确定"是不是这个文件"。
@@ -684,17 +694,141 @@ func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
 			}
 			val, kind, seq, found, err := db.probeFile(f.Num, snapshot, userKey)
 			if err != nil {
-				return nil, err
+				return nil, 0, 0, err
 			}
 			if found {
-				if v.RangeCovers(userKey, seq, snapshot) {
-					return nil, ErrNotFound
-				}
-				return valueOf(val, kind)
+				return val, kind, seq, nil
 			}
 		}
 	}
-	return nil, ErrNotFound
+	return nil, 0, 0, ErrNotFound
+}
+
+// foldMergeLocked 收集并折叠 userKey 的 merge operand 链（M8）。
+//
+// hitSeq / hitOperand 是已经通过可见性与范围遮蔽检查的最新 operand；收集从
+// 它以下继续：按"MemTable → Immutable → L0（从新到旧）→ L1 以下"的顺序逐
+// 来源下探，把 TypeMerge 的 operand 收进列表，直到遇到可见的 TypeValue
+// （作为 base）或可见的 TypeDeletion（base 为 nil，更旧的记录全部作废）。
+//
+// 两个逐条判定的细节：
+//
+//   - 被范围墓碑遮蔽的记录**跳过**而不是终止：遮蔽按记录逐条判定，一条被
+//     盖住的 Value 对这个快照等于不存在，它下面的 operand 链要继续收；
+//   - 收集从 seq < hitSeq 开始：命中来源里比命中记录新的版本要么不存在、
+//     要么 seq > snapshot（对快照不可见），统一用这个条件排除。
+//
+// 收集完毕后按 seq 从旧到新调 FullMerge。算子返回 error ⇒ 读失败——
+// 折叠不出"这个 key 现在的值"时，静默返回旧值等于给错误的数据。
+func (db *DB) foldMergeLocked(snapshot uint64, userKey []byte, hitSeq uint64, hitOperand []byte) ([]byte, error) {
+	op := db.opts.MergeOperator
+	if op == nil {
+		return nil, ErrNoMergeOperator
+	}
+	// hitOperand 可能指向 SST 块缓存里的字节；折叠要等整条链收集完才发生，
+	// 先复制一份（memdb 的值虽然稳定，统一复制省得区分来源）。
+	hitOperand = append([]byte(nil), hitOperand...)
+	// operands 的收集顺序是从新到旧；FullMerge 要求从旧到新，最后反转。
+	operands := [][]byte{hitOperand}
+	var base []byte
+	hasBase := false
+
+	// visit 处理一条候选记录；返回 false 表示收集终止（遇到了终局）。
+	// value 一律复制：SST 迭代器的 value 指向块缓存，链要跨多条记录收集。
+	visit := func(seq uint64, kind key.Kind, value []byte) bool {
+		if db.v.RangeCovers(userKey, seq, snapshot) {
+			return true // 被遮蔽：对这个快照不可见，跳过继续收集
+		}
+		switch kind {
+		case key.TypeMerge:
+			operands = append(operands, append([]byte(nil), value...))
+			return true
+		case key.TypeValue:
+			base, hasBase = append([]byte(nil), value...), true
+			return false
+		case key.TypeDeletion:
+			// key 在此被删除：base 为 nil，更旧的记录对任何快照都作废。
+			hasBase = true
+			return false
+		default:
+			return true
+		}
+	}
+
+	// walkMem 下探一张 MemTable：定位到最新可见版本后逐个更旧版本走。
+	walkMem := func(m *memdb.MemTable) {
+		if hasBase || m == nil {
+			return
+		}
+		it := m.Seek(snapshot, userKey)
+		for it.Valid() {
+			ik := it.Key()
+			if db.cmp.Compare(key.UserKey(ik), userKey) != 0 {
+				return
+			}
+			if seq := key.SeqNum(ik); seq < hitSeq {
+				if !visit(seq, key.KindOf(ik), it.Value()) {
+					return
+				}
+			}
+			it.Next()
+		}
+	}
+
+	// walkFile 下探一个 SST：与 walkMem 同构，定位用 internal key seek。
+	walkFile := func(num uint64) error {
+		if hasBase {
+			return nil
+		}
+		r, err := db.readerFor(num)
+		if err != nil {
+			return err
+		}
+		it := r.NewIterator()
+		for it.Seek(key.SeekKey(userKey, snapshot)); it.Valid(); it.Next() {
+			ik := it.Key()
+			if db.icmp.CompareUser(key.UserKey(ik), userKey) != 0 {
+				return nil
+			}
+			if seq := key.SeqNum(ik); seq < hitSeq {
+				if !visit(seq, key.KindOf(ik), it.Value()) {
+					return nil
+				}
+			}
+		}
+		return it.Error()
+	}
+
+	walkMem(db.mem)
+	walkMem(db.imm)
+	v := db.v
+	l0 := v.Files(0)
+	for i := len(l0) - 1; i >= 0 && !hasBase; i-- {
+		if err := walkFile(l0[i].Num); err != nil {
+			return nil, err
+		}
+	}
+	if v.NumLevels() > 1 && !hasBase {
+		target := key.SeekKey(userKey, snapshot)
+		for level := 1; level < v.NumLevels() && !hasBase; level++ {
+			f := v.FindFile(level, userKey, target)
+			if f == nil {
+				continue
+			}
+			if err := walkFile(f.Num); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	for i, j := 0, len(operands)-1; i < j; i, j = i+1, j-1 {
+		operands[i], operands[j] = operands[j], operands[i]
+	}
+	merged, err := op.FullMerge(userKey, base, operands)
+	if err != nil {
+		return nil, fmt.Errorf("kvdb: merge operator %q: %w", op.Name(), err)
+	}
+	return merged, nil
 }
 
 // probeFile 在编号为 num 的 SST 里查一次，并记录读放大。

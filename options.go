@@ -213,6 +213,18 @@ type Options struct {
 	// （过滤是幂等的，重放后再 Flush 会再次清掉）。
 	FilterOnFlush bool
 
+	// MergeOperator 定义 merge operand 的折叠方式（M8）。nil = 不支持 Merge，
+	// 此时调用 DB.Merge / WriteBatch.Merge 会返回 ErrNoMergeOperator。
+	//
+	// 读路径命中 merge 记录后要把同 key 的 operand 链收集齐交给 FullMerge，
+	// 所以"读变贵"是 Merge 的固有代价；稳态下 Compaction 把每个 key 折叠回
+	// 一条 Value，代价由后台抵消。
+	//
+	// Name() 会被写进 Manifest 校验，语义同 Comparer：写过 merge 记录的目录
+	// 之后只能用同名算子打开——换一套折叠语义读老目录，未折叠的 operand 会
+	// 被折出错误的值。
+	MergeOperator MergeOperator
+
 	// LogMaxSize 是数据目录下 LOG 文件的轮转阈值，单位字节。
 	//
 	// 0 = 用 DefaultLogMaxSize（1MB）；负数 = 不写文件日志（Logger 为 nil 时

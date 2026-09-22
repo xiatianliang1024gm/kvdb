@@ -66,6 +66,11 @@ func (db *DB) Write(b *WriteBatch) error {
 	if b == nil || b.Len() == 0 {
 		return nil
 	}
+	// 批次里有 merge 记录但没配算子：写之前就拒绝。这种数据一旦落盘，
+	// 读路径折不出值、Manifest 也不会记算子名——是静默的数据不可用。
+	if b.hasMerge && db.opts.MergeOperator == nil {
+		return ErrNoMergeOperator
+	}
 	req := &writeRequest{batch: b}
 
 	db.wmu.Lock()

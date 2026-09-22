@@ -189,6 +189,7 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 	levels := make([][]*FileMeta, vs.cfg.MaxLevels)
 	recordedName := ""
 	recordedFilterName := ""
+	recordedMergeName := ""
 	// 范围墓碑（M7）：随每条记录增量收集，循环结束后统一套用退休、排序去重。
 	var rangeDels []key.RangeDeletion
 	var retiredRanges []key.RangeDeletion
@@ -224,6 +225,13 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 				recordedFilterName = e.FilterName
 			} else if recordedFilterName != e.FilterName {
 				return truncated, fmt.Errorf("kvdb/version: manifest %s mixes compaction filters %q and %q", path, recordedFilterName, e.FilterName)
+			}
+		}
+		if e.MergeOperatorName != "" {
+			if recordedMergeName == "" {
+				recordedMergeName = e.MergeOperatorName
+			} else if recordedMergeName != e.MergeOperatorName {
+				return truncated, fmt.Errorf("kvdb/version: manifest %s mixes merge operators %q and %q", path, recordedMergeName, e.MergeOperatorName)
 			}
 		}
 		vs.applyCountersLocked(e)
@@ -270,6 +278,14 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 		return truncated, fmt.Errorf(
 			"kvdb/version: data directory was written with compaction filter %q, but the option specifies %q",
 			recordedFilterName, vs.filterName)
+	}
+	// Merge 算子名字的校验与过滤器同一档：老目录可以首次配算子，但写过
+	// merge 记录之后名字就冻结——换名或去掉都被拒绝。去掉之所以也是事故：
+	// 没有算子，目录里未折叠的 operand 就读不回来。
+	if recordedMergeName != "" && recordedMergeName != vs.mergeName {
+		return truncated, fmt.Errorf(
+			"kvdb/version: data directory was written with merge operator %q, but the option specifies %q",
+			recordedMergeName, vs.mergeName)
 	}
 
 	old := vs.current
@@ -344,11 +360,12 @@ func (vs *VersionSet) NewManifest() error {
 // 两者的差别就在这把锁上，所以实现共用一个内部函数）。
 func (vs *VersionSet) snapshotEditLocked() *VersionEdit {
 	edit := &VersionEdit{
-		ComparatorName: vs.comparerName,
-		FilterName:     vs.filterName,
-		NextFileNum:    vs.nextFileNum,
-		LastSeq:        vs.lastSeq,
-		LogNumber:      vs.logNumber,
+		ComparatorName:    vs.comparerName,
+		FilterName:        vs.filterName,
+		MergeOperatorName: vs.mergeName,
+		NextFileNum:       vs.nextFileNum,
+		LastSeq:           vs.lastSeq,
+		LogNumber:         vs.logNumber,
 	}
 	for level, files := range vs.current.levels {
 		for _, fm := range files {

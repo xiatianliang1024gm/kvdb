@@ -142,7 +142,7 @@ func (db *DB) newIteratorLocked(snapshot uint64, opt *IteratorOptions) Iterator 
 		}
 	}
 	return &versionedIterator{
-		DBIter: iterator.NewDBIter(db.icmp, iterator.NewMerging(db.icmp, children...), snapshot, lower, upper, v.RangeDeletions()),
+		DBIter: iterator.NewDBIter(db.icmp, iterator.NewMerging(db.icmp, children...), snapshot, lower, upper, v.RangeDeletions(), db.opts.MergeOperator),
 		db:     db,
 		v:      v,
 	}

@@ -4,7 +4,8 @@
 >
 > 本文只写"还缺什么、怎么补"；**kvdb 现有的功能以 `docs/DESIGN.md` 为准**，两份文档不重叠。
 >
-> 状态：M6（§4.2 CompactionFilter）与 M7（§4.1 DeleteRange + §5.1 半开上界/Prefix）已实施 ｜ 最后更新：2026-09-22
+> 状态：M6（§4.2 CompactionFilter）、M7（§4.1 DeleteRange + §5.1 半开上界/Prefix）
+> 与 M8（§4.3 Merge 算子）已实施 ｜ 最后更新：2026-09-22
 
 ## 目录
 
@@ -214,6 +215,7 @@ type MergeOperator interface {
 - **读路径变贵是 Merge 的固有代价。** 命中 TypeMerge 后不能立刻返回，要继续向下收集同 key 的全部 operand，直到遇到 `TypeValue` / `TypeDeletion` 或无更多版本，再按 seq **从旧到新** FullMerge。稳态下这个代价由 Compaction 抵消——**所以 Compaction 侧的折叠才是这个特性的收益所在，不是可选项**。
 - **Compaction 折叠**：同 key 的连续 Merge 记录用 `PartialMerge` 折叠；遇到 base（`TypeValue`）就 `FullMerge` 出一条 TypeValue。稳态下每个 key 只剩一条 Value。
 - **`covered` 逻辑必须改**：现在是"遇到 `seq <= SmallestSnapshot` 的第一条就 `covered = true`，之后同 key 全丢"（`run.go:219`）。有 Merge 之后这条不成立——Merge operand 必须收集齐才能丢。**新规则：`covered` 只在遇到 `TypeValue` / `TypeDeletion` 时置位。** 这是实现上最容易写错的一处。
+- **Seek 定位边界必须跟着改**：`SeekKey` 的定位尾缀原来是 `(snapshot, TypeValue)`，在只有 Value（1）/ Deletion（0）时它是"seq <= snapshot 的最大尾缀"；TypeMerge（2）比它大——与定位点**同序列号**的 merge 记录会被 Seek 静默跳过，读到旧版本。M8 起定位尾缀取 kind 字段的上界（`0xFF`），对任何未来的新类型都成立。（RocksDB 为同一原因把 `kValueTypeForSeek` 定成 `kTypeMerge`。）
 - **要求算子满足结合律**，否则禁止实现 `PartialMerge`（只能返回 `ok=false`）。理由：`PartialMerge` 的结果会再参与后续折叠，不满足结合律时会与 `FullMerge` 的结果不一致，而引擎无法替上层发现这件事。
 - **filter 看到的是折叠后的值**：先折叠成 TypeValue 再交给 filter，让 filter 不必理解 operand 语义（4.2 与 4.3 都做时，顺序是 Merge 折叠 → filter 判定）。
 - `Name()` 同样写进 Manifest 校验。

@@ -19,6 +19,9 @@ coverage.txt
 /_probe.txt
 /_*.log
 /_*.py
+/m8debug_test.go
+/m8debug.log
+/gitstatus.log
 
 # WorkBuddy 的工作区数据（会话记录、memory 等），不进版本库
 /.workbuddy/

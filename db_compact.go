@@ -72,6 +72,7 @@ func (db *DB) runCompactions() error {
 			TargetFileSize:  db.opts.targetFileSize(c.OutputLevel),
 			SmallestSnapshot: snapshot,
 			Filter:          db.opts.CompactionFilter,
+			Merge:           db.opts.MergeOperator,
 			RangeDeletions:  v.RangeDeletions(),
 			AllocFileNum:    db.vset.AllocFileNum,
 			Reader:          db.readerForMaintenance,

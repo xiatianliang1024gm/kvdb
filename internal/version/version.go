@@ -357,6 +357,10 @@ type Config struct {
 	// 它会写进 Manifest 并在重放时校验，语义同 Comparer 的名字：目录一旦用某个
 	// 过滤器落过盘，之后就只能用同名过滤器打开。
 	FilterName string
+	// MergeName 是 Merge 算子的稳定标识（未配置算子时为空），语义同 FilterName。
+	// 差别在方向：没写过 merge 记录的目录可以随时配上算子；写过之后换名或
+	// 去掉都会被拒——没有算子，未折叠的 operand 就读不回来。
+	MergeName string
 	// MaxLevels 是层数（含 L0）。
 	MaxLevels int
 }
@@ -383,6 +387,7 @@ type VersionSet struct {
 	manifestNum  uint64
 	comparerName string
 	filterName   string
+	mergeName    string
 	closed       bool
 }
 
@@ -397,6 +402,7 @@ func New(cfg Config) *VersionSet {
 		icmp:         key.InternalComparer{User: cfg.Comparer},
 		comparerName: cfg.Comparer.Name(),
 		filterName:   cfg.FilterName,
+		mergeName:    cfg.MergeName,
 		nextFileNum:  1,
 	}
 	vs.current = vs.emptyVersion()

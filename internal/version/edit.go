@@ -25,6 +25,11 @@ type VersionEdit struct {
 	// 空字符串表示"这个目录从未配置过过滤器"——一旦记了名字就冻结。
 	FilterName string
 
+	// MergeOperatorName 是 Merge 算子的名字，语义同 FilterName（M8）。
+	// 差别在方向：没写过 merge 记录的目录可以随时配上算子；但写过之后
+	// 换名或去掉都会被拒——没有算子，目录里未折叠的 operand 就读不回来。
+	MergeOperatorName string
+
 	// NextFileNum 是"本记录生效之后"的下一个可用文件编号。
 	NextFileNum uint64
 	// LastSeq 是已提交的最大序列号。
@@ -63,7 +68,7 @@ type FileEdit struct {
 
 // 标签值沿用 LevelDB 的编号（1..9），便于对照它的 Manifest 实现排查问题。
 // 10 / 11 留给 M7 的范围删除（RangeDeletions / RetiredTombstones，见
-// docs/EXTENSIONS.md），FilterName 从 12 起编。
+// docs/EXTENSIONS.md），FilterName 从 12 起编，MergeOperatorName 是 13。
 // 用"每段自带标签"而不是固定顺序，是为了让将来的字段可以只出现在部分记录里：
 // 重放一串历史记录时，老记录里没有新字段是正常的，固定顺序做不到这点。
 const (
@@ -77,6 +82,7 @@ const (
 	tagRangeDeletion   = 10
 	tagRetiredTombstone = 11
 	tagFilterName      = 12
+	tagMergeName       = 13
 )
 
 // Encode 把变更编码成一个字节串。零值字段不写入，因此"只改文件列表"的记录非常小。
@@ -89,6 +95,10 @@ func (e *VersionEdit) Encode() []byte {
 	if e.FilterName != "" {
 		dst = key.PutUvarint(dst, tagFilterName)
 		dst = appendBytes(dst, []byte(e.FilterName))
+	}
+	if e.MergeOperatorName != "" {
+		dst = key.PutUvarint(dst, tagMergeName)
+		dst = appendBytes(dst, []byte(e.MergeOperatorName))
 	}
 	if e.LogNumber != 0 {
 		dst = key.PutUvarint(dst, tagLogNumber)
@@ -156,6 +166,12 @@ func DecodeVersionEdit(buf []byte) (*VersionEdit, error) {
 				return nil, err
 			}
 			e.FilterName = string(b)
+		case tagMergeName:
+			b, err := r.bytes()
+			if err != nil {
+				return nil, err
+			}
+			e.MergeOperatorName = string(b)
 		case tagLogNumber:
 			if e.LogNumber, err = r.uvarint(); err != nil {
 				return nil, err

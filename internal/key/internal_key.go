@@ -166,7 +166,7 @@ func DecodeInternalKey(ik []byte) (userKey []byte, seq uint64, kind Kind, err er
 	trailer := binary.BigEndian.Uint64(ik[len(ik)-TrailerLen:])
 	seq, kind = trailer>>8, Kind(trailer&0xff)
 	switch kind {
-	case TypeDeletion, TypeValue, TypeRangeDeletion:
+	case TypeDeletion, TypeValue, TypeMerge, TypeRangeDeletion:
 	default:
 		return nil, 0, 0, fmt.Errorf("%w: unknown kind %d", ErrCorruptInternalKey, uint8(kind))
 	}
@@ -182,13 +182,23 @@ func ParseInternalKey(ik []byte) (ParsedInternalKey, error) {
 	return ParsedInternalKey{UserKey: userKey, Seq: seq, Kind: kind}, nil
 }
 
-// SeekKey 返回"在 snapshot 序列号下查找 key"的定位 key：user_key + (snapshot<<8 | TypeValue)。
+// seekTrailerKind 是定位目标（SeekKey）里 kind 字段的取值：Kind 字段的上界 0xFF。
 //
-// 由于尾缀按降序排列，尾缀 (snapshot, TypeValue) 恰好是"seq <= snapshot 的全部版本"中最大的那个，
-// 因此它在有序序列里排在所有可见版本之前。用它做 seek 目标，落点就是该 key 在 snapshot 下
-// 最新的可见记录；若该记录是墓碑，则说明 key 在 snapshot 时刻已被删除。
+// 定位目标必须是"seq <= snapshot 的全部记录"里**最大**的尾缀，这样 Seek 的
+// 落点（尾缀降序下第一个 >= 目标的记录）才是最新的可见版本。旧实现用
+// TypeValue，在只有 Value / Deletion 两种类型时成立；M8 引入 TypeMerge
+// （2 > 1）之后，与定位点**同序列号**的 merge 记录尾缀更大、排在目标之前，
+// 会被 Seek 静默跳过——读到的就是旧版本。取上界 0xFF 对任何未来的新类型
+// 都成立。（RocksDB 为同一个原因把 kValueTypeForSeek 定成 kTypeMerge。）
+const seekTrailerKind = Kind(0xFF)
+
+// SeekKey 返回"在 snapshot 序列号下查找 key"的定位 key：user_key + (snapshot<<8 | 0xFF)。
+//
+// 尾缀按降序排列，而 (snapshot, 0xFF) 是"seq <= snapshot 的全部版本"可能取到的
+// 最大尾缀，因此 seek 的落点恰好是该 key 在 snapshot 下最新的可见记录；
+// 若该记录是墓碑，则说明 key 在 snapshot 时刻已被删除。
 func SeekKey(userKey []byte, snapshot uint64) []byte {
-	return EncodeInternalKey(userKey, snapshot, TypeValue)
+	return EncodeInternalKey(userKey, snapshot, seekTrailerKind)
 }
 
 // InternalKeyCompare 按 internal key 的规则比较 a 与 b：

@@ -74,6 +74,15 @@ type Env struct {
 	// 大面积失效 —— 这与"快照钉住 GC"是同一件事的两个面。
 	Filter Filter
 
+	// Merge 非 nil 时启用 Merge 折叠（M8）：同 key 的 merge operand 链被
+	// 收集折叠成一条 TypeValue，稳态下每个 key 只剩一条 Value，读路径的
+	// "收集 operand"成本由这里抵消。
+	//
+	// 与 Filter 的先后顺序是固定的：**先折叠、再过滤**——filter 看到的是
+	// 折叠后的值，不必理解 operand 语义。目录里有 merge 记录就必然配了算子
+	//（Manifest 校验保证），这里 nil 只可能是程序缺陷，遇到直接报错。
+	Merge MergeOperator
+
 	// RangeDeletions 是当前版本的范围墓碑表（M7，只读）。归并循环用它做两件事：
 	//
 	//   - **遮蔽丢弃**：seq <= SmallestSnapshot 的记录若被某条墓碑盖住
@@ -222,34 +231,174 @@ func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 	// covered 表示"当前 user key 最新可见的那个版本已经写出去了"，之后同 key 的更旧版本
 	// 谁也读不到，可以整段丢掉。归并流在同一 user key 内按 seq 降序排列，
 	// 所以这个状态只需要一个布尔量。
+	//
+	// M8 起置位规则收窄：**只在写出 TypeValue / TypeDeletion 时置位**。
+	// Merge operand 必须收集齐才能折叠，链没走完之前不能宣布"这个 key 的
+	// 答案已经写出去"——沿用旧规则会把还没折叠的 operand 当旧版本丢掉。
 	covered := false
 
-	for mi.SeekToFirst(); mi.Valid(); mi.Next() {
+	// foldMerge 收集并折叠从 mi 当前位置开始的 merge operand 链（M8）。
+	// 调用时 mi 停在链首：该 user key 第一条 seq <= SmallestSnapshot 且未被
+	// 遮蔽的 TypeMerge 记录。链首之下所有记录都 <= SmallestSnapshot（同 key
+	// 按 seq 降序），链首之上若有更新的 operand，它们已在主循环里原样透传，
+	// 读路径会把它们叠在本次折叠出的 Value 之上，语义自洽。
+	//
+	// 消费规则：mi 一路推进到"下一条待处理记录"——链内每条记录（含终局记录）
+	// 都被消费掉，最终停在下一个 user key 的第一条记录、终局之后的第一条
+	// 同 key 旧记录、或流尽头。调用方在本层不再推进（advance = false）。
+	//
+	// 产出：
+	//   - 收齐 base（可见 Value；或可见 Deletion ⇒ base 为 nil，更旧的记录
+	//     对任何存活快照都作废）⇒ 折叠成一条 seq = seqFirst 的 TypeValue，
+	//     先过 filter 再写出；
+	//   - 没收齐 base ⇒ 只有输出层以下没有这个 key 的任何数据（isBaseLevel）
+	//     时才允许折叠；否则 operand 原样透传——深层可能还有 base 或更旧的
+	//     operand，现在折会把它们永久遮掉。透传保持 seq 降序，输出文件
+	//     "同 key 版本相邻且降序"的排序前提不破坏。
+	foldMerge := func(uk []byte, seqFirst uint64) error {
+		if env.Merge == nil {
+			return fmt.Errorf("kvdb/compact: merge record found but no merge operator configured")
+		}
+		// 归并流的 Key() 指向子迭代器的重建缓冲区，推进就会被覆盖；
+		// 而折叠要等整条链收集完才发生，这里必须先复制。
+		uk = append([]byte(nil), uk...)
+		type operand struct {
+			seq uint64
+			val []byte
+		}
+		var operands []operand // 收集顺序：新 → 旧（与归并流一致）
+		var baseVal []byte
+		hasBase := false
+		consumed := 0 // 收进折叠的记录数（operand + 终局；被遮蔽跳过的不算）
+		for mi.Valid() {
+			ik := mi.Key()
+			cur := key.UserKey(ik)
+			if env.ICmp.CompareUser(cur, uk) != 0 {
+				break // 链在 key 边界结束：本输入内没有终局
+			}
+			seq := key.SeqNum(ik)
+			res.InputRecords++
+			if key.CoveredByRange(env.RangeDeletions, env.ICmp.CompareUser, cur, seq, env.SmallestSnapshot) {
+				// 被遮蔽 = 对所有存活快照不可见，丢弃后链继续收。
+				res.DroppedRecords++
+				mi.Next()
+				continue
+			}
+			consumed++
+			switch key.KindOf(ik) {
+			case key.TypeMerge:
+				// 先试 PartialMerge：把更旧的这条并进已收下的最后一个 operand。
+				// 参数顺序按"从旧到新应用"：v 更旧，operands[n-1] 更新。
+				// 只有满足结合律的算子才敢返回 ok=true（MergeOperator 的契约），
+				// ok=false 就原样保留两个 operand，等 FullMerge 一次折完。
+				// value 指向块数据，链要跨多条记录收集，一律复制。
+				v := append([]byte(nil), mi.Value()...)
+				if n := len(operands); n > 0 {
+					if m, ok := env.Merge.PartialMerge(uk, v, operands[n-1].val); ok {
+						// 合并结果代表"截至 operands[n-1].seq 的全部叠加"，
+						// 序列号沿用其中较新的那个。
+						operands[n-1].val = m
+						break
+					}
+				}
+				operands = append(operands, operand{seq: seq, val: v})
+			case key.TypeValue:
+				baseVal, hasBase = append([]byte(nil), mi.Value()...), true
+			case key.TypeDeletion:
+				hasBase = true // base 为 nil：key 在链中间被删除
+			}
+			mi.Next()
+			if hasBase {
+				break
+			}
+		}
+
+		if !hasBase && !base.isBaseLevel(uk) {
+			for _, op := range operands {
+				if err := out.add(key.EncodeInternalKey(uk, op.seq, key.TypeMerge), op.val); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		// FullMerge 要求 operand 按 seq 从旧到新：反转收集顺序。
+		vals := make([][]byte, len(operands))
+		for i, op := range operands {
+			vals[len(operands)-1-i] = op.val
+		}
+		merged, err := env.Merge.FullMerge(uk, baseVal, vals)
+		if err != nil {
+			return fmt.Errorf("kvdb/compact: merge operator %q: %w", env.Merge.Name(), err)
+		}
+		// 链里的每条记录都被这唯一一条输出取代。
+		res.DroppedRecords += consumed
+		// 折叠结果就是"这个 key 当前的值"：先过 filter（M6 与 M8 的顺序：
+		// Merge 折叠 → filter 判定），filter 看到的已经是 Value 不是 operand。
+		if env.Filter != nil {
+			d, ferr := env.Filter.Filter(c.OutputLevel, uk, merged, seqFirst)
+			if ferr != nil {
+				return fmt.Errorf("kvdb/compact: compaction filter %q: %w", env.Filter.Name(), ferr)
+			}
+			if d == Drop {
+				// 与 Value 分支的 Drop 同构：深层可能还有更旧版本时写一条
+				// 同序列号的墓碑继续遮蔽，是 base level 才整条丢掉。
+				if base.isBaseLevel(uk) {
+					return nil
+				}
+				return out.add(key.EncodeInternalKey(uk, seqFirst, key.TypeDeletion), nil)
+			}
+		}
+		return out.add(key.EncodeInternalKey(uk, seqFirst, key.TypeValue), merged)
+	}
+
+	// advance 表示"当前记录已处理完毕，推进归并流"。Merge 折叠会一次消费
+	// 整个链并停在下一条待处理记录上，此时绝不能再推——否则会跳过下一条
+	// 记录（它可能是下一个 user key 的第一条）。
+	for mi.SeekToFirst(); mi.Valid(); {
 		ik := mi.Key()
 		uk := key.UserKey(ik)
+		advance := true
 
 		if lastUserKey == nil || env.ICmp.CompareUser(uk, lastUserKey) != 0 {
 			lastUserKey = append(lastUserKey[:0], uk...)
 			covered = false
 		}
-		if covered {
+
+		seq := key.SeqNum(ik)
+		kind := key.KindOf(ik)
+
+		switch {
+		case covered:
 			res.DroppedRecords++
-			continue
-		}
-		if key.SeqNum(ik) <= env.SmallestSnapshot {
-			// 范围墓碑遮蔽（M7）：在 covered 判定**之前**检查。被盖住的记录
-			// 对所有现存与未来的读者都不可见（seq < T.Seq <= SmallestSnapshot），
-			// 整条丢掉。不能置 covered：那条语义是"这个 key 的答案已经写出去了"，
-			// 而这里什么都没写——后续同 key 记录还会逐条走到这个分支，
-			// 它们同样被盖住（遮蔽条件随 seq 减小单调成立），同样丢掉。
-			if key.CoveredByRange(env.RangeDeletions, env.ICmp.CompareUser, uk, key.SeqNum(ik), env.SmallestSnapshot) {
-				res.DroppedRecords++
-				continue
+		case seq > env.SmallestSnapshot:
+			// 比最小存活快照新的版本：可能有读者，原样保留。
+			// merge operand 也在此列——它们会由读路径叠在折叠结果之上。
+			res.InputRecords++
+			if err := out.add(ik, mi.Value()); err != nil {
+				return res, err
 			}
+		case key.CoveredByRange(env.RangeDeletions, env.ICmp.CompareUser, uk, seq, env.SmallestSnapshot):
+			// 范围墓碑遮蔽（M7）：被盖住的记录对所有现存与未来的读者都不可见
+			// （seq < T.Seq <= SmallestSnapshot），整条丢掉。不能置 covered：
+			// 那条语义是"这个 key 的答案已经写出去了"，而这里什么都没写——
+			// 后续同 key 记录还会逐条走到这一层，它们同样被盖住
+			//（遮蔽条件随 seq 减小单调成立），同样丢掉。
+			res.DroppedRecords++
+		case kind == key.TypeMerge:
+			// M8：收集并折叠整个 operand 链，产出一条 TypeValue（或透传）。
+			advance = false
+			if err := foldMerge(uk, seq); err != nil {
+				return res, err
+			}
+			// 链内所有记录都已消费：本输入内这个 key 的答案已经定了，
+			// 之后若还有同 key 旧记录（终局之后的残尾）全部按 covered 丢弃。
 			covered = true
-			kind := key.KindOf(ik)
-			if env.Filter != nil && kind == key.TypeValue {
-				d, ferr := env.Filter.Filter(c.OutputLevel, uk, mi.Value(), key.SeqNum(ik))
+		default:
+			// TypeValue / TypeDeletion：这个 key 的答案在这里。
+			covered = true
+			if kind == key.TypeValue && env.Filter != nil {
+				d, ferr := env.Filter.Filter(c.OutputLevel, uk, mi.Value(), seq)
 				if ferr != nil {
 					return res, fmt.Errorf("kvdb/compact: compaction filter %q: %w", env.Filter.Name(), ferr)
 				}
@@ -257,17 +406,17 @@ func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 					// filter 说丢，语义上等价于这条数据被删除。但"跳过不写"不够：
 					// 更深层可能还躺着一个更旧的版本，丢掉本层的记录会让它复活。
 					// 处理沿用墓碑的退休判据（与下面的 TypeDeletion 分支完全同构）：
-					// 是 base level 就整条丢掉，否则写一条**同序列号**的墓碑继续遮蔽，
-					// 交给以后的 Compaction 退休。
+					// 是 base level 就整条丢掉，否则写一条**同序列号**的墓碑继续
+					// 遮蔽，交给以后的 Compaction 退休。
 					if base.isBaseLevel(uk) {
 						res.DroppedRecords++
-						continue
+						break
 					}
 					res.InputRecords++
-					if err := out.add(key.EncodeInternalKey(uk, key.SeqNum(ik), key.TypeDeletion), nil); err != nil {
+					if err := out.add(key.EncodeInternalKey(uk, seq, key.TypeDeletion), nil); err != nil {
 						return res, err
 					}
-					continue
+					break
 				}
 			}
 			if kind == key.TypeDeletion && base.isBaseLevel(uk) {
@@ -276,12 +425,16 @@ func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 				// 不满足这个条件时保守保留：把墓碑留下只会浪费一点空间，
 				// 丢掉一个还需要的墓碑则会让人读到本该已删除的旧值。
 				res.DroppedRecords++
-				continue
+				break
+			}
+			res.InputRecords++
+			if err := out.add(ik, mi.Value()); err != nil {
+				return res, err
 			}
 		}
-		res.InputRecords++
-		if err := out.add(ik, mi.Value()); err != nil {
-			return res, err
+
+		if advance {
+			mi.Next()
 		}
 	}
 	if err := mi.Error(); err != nil {
