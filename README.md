@@ -90,7 +90,7 @@ func main() {
     v, _ := snap.Get([]byte("a"))
     fmt.Println(string(v))
 
-    // 范围扫描（闭区间）
+    // 范围扫描（半开区间：下界含、上界不含；也支持 Prefix 前缀扫描）
     it := db.NewIterator(&kvdb.IteratorOptions{
         LowerBound: []byte("a"),
         UpperBound: []byte("z"),

@@ -225,8 +225,22 @@ func (db *DB) applyWriteGroup(group []*writeRequest, firstSeq, lastSeq uint64, w
 		return db.bgErr
 	}
 
+	// 收集本组里的范围墓碑（M7）：它们**不进 MemTable**——读路径只在
+	// Version 的全局表上判范围遮蔽，把墓碑塞进 MemTable 反而要给 Flush、
+	// 迭代器各加一套处理。它随本组的 WAL 记录落盘（崩溃安全的来源），
+	// 并在下面的同一临界区里提交到 Version。
+	var newRanges []key.RangeDeletion
 	for _, r := range group {
 		if err := r.batch.rangeRecords(r.seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
+			if kind == key.TypeRangeDeletion {
+				// rangeRecords 给出的切片指向批次缓冲，Version 会长期持有，复制一份。
+				newRanges = append(newRanges, key.RangeDeletion{
+					Start: append([]byte(nil), userKey...),
+					End:   append([]byte(nil), value...),
+					Seq:   seq,
+				})
+				return true
+			}
 			db.mem.Add(seq, kind, userKey, value)
 			return true
 		}); err != nil {
@@ -236,6 +250,20 @@ func (db *DB) applyWriteGroup(group []*writeRequest, firstSeq, lastSeq uint64, w
 		}
 	}
 	db.lastSeq = lastSeq
+
+	// 范围墓碑在同一临界区里提交到 Version：这个临界区结束（读者可以进来了）
+	// 时，"范围内不可见"必须已经生效，否则组提交的原子性对范围删除不成立。
+	// Manifest 追加失败 ⇒ 整组失败 + 停库，与其它提交失败同一待遇；
+	// WAL 记录还在，重启重放会把墓碑补回来。
+	if len(newRanges) > 0 {
+		edit := db.baseEdit()
+		edit.RangeDeletions = newRanges
+		if err := db.logAndApplyLocked(edit); err != nil {
+			err = fmt.Errorf("kvdb: commit range deletion: %w", err)
+			db.failLocked(err)
+			return err
+		}
+	}
 
 	// 组提交的规模指标。只有队长会走到这里，所以不需要 CAS。
 	n := int64(len(group))

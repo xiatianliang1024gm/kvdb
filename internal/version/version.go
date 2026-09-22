@@ -23,6 +23,7 @@
 package version
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -75,7 +76,12 @@ func fileFromEdit(level int, e FileEdit) *FileMeta {
 type Version struct {
 	vset   *VersionSet
 	levels [][]*FileMeta
-	refs   atomic.Int32
+	// rangeDels 是范围墓碑的全局有序表（M7）：按 (Start, End, Seq) 升序，
+	// 不含重复项。它与 levels 一样不可变：每次变更都在派生新版本时重建。
+	// 点查命中记录后在这里查一次"是否被范围删除盖住"，范围数是
+	// "执行过的范围删除次数"，几十量级，线性扫足够。
+	rangeDels []key.RangeDeletion
+	refs      atomic.Int32
 }
 
 // Ref 增加一个引用。调用方用完之后必须 Unref。
@@ -132,6 +138,20 @@ func (v *Version) Files(level int) []*FileMeta {
 	return v.levels[level]
 }
 
+// RangeDeletions 返回范围墓碑表（只读，调用方不得修改）。
+// Compaction 构造输入时用它把当前版本的遮蔽信息带给归并循环。
+func (v *Version) RangeDeletions() []key.RangeDeletion { return v.rangeDels }
+
+// RangeDeletionCount 返回范围墓碑条数，供 Stats 观察退休进度。
+func (v *Version) RangeDeletionCount() int { return len(v.rangeDels) }
+
+// RangeCovers 判断 (userKey, seq) 的记录是否被范围墓碑遮蔽：
+// 存在 T 使 Start <= userKey < End 且 seq < T.Seq <= snapshot。
+// snapshot 传的是读者（点查/快照/迭代器）的快照序列号。
+func (v *Version) RangeCovers(userKey []byte, seq, snapshot uint64) bool {
+	return key.CoveredByRange(v.rangeDels, v.vset.icmp.User.Compare, userKey, seq, snapshot)
+}
+
 // FileCount 返回参与读取的文件总数（所有层之和）。
 func (v *Version) FileCount() int {
 	n := 0
@@ -180,7 +200,57 @@ func (v *Version) applyEdit(e *VersionEdit) (*Version, error) {
 		}
 		levels[a.Level] = insertFile(levels[a.Level], fileFromEdit(a.Level, a), v.vset.icmp, a.Level == 0)
 	}
-	return &Version{vset: v.vset, levels: levels}, nil
+	return &Version{vset: v.vset, levels: levels, rangeDels: applyRangeDeletions(v.rangeDels, e)}, nil
+}
+
+// applyRangeDeletions 在旧的范围墓碑表上套用一次变更：先摘退休的，再加新的，
+// 最后归一化（排序 + 去重）。去重是崩溃恢复的需要：范围删除先随 WAL 记录
+// 落盘、又在同一临界区里提交到 Manifest，"Manifest 提交成功但 WAL 还没截断"
+// 时重启，重放会把同一条墓碑再交上来一次——按 (Start, End, Seq) 精确去重后，
+// 重复提交是无害的幂等操作。
+func applyRangeDeletions(old []key.RangeDeletion, e *VersionEdit) []key.RangeDeletion {
+	if len(e.RangeDeletions) == 0 && len(e.RetiredTombstones) == 0 {
+		return old
+	}
+	out := make([]key.RangeDeletion, 0, len(old)+len(e.RangeDeletions))
+	for _, t := range old {
+		if !containsRangeDeletion(e.RetiredTombstones, t) {
+			out = append(out, t)
+		}
+	}
+	out = append(out, e.RangeDeletions...)
+	return normalizeRangeDeletions(out)
+}
+
+// containsRangeDeletion 按 (Start, End, Seq) 三元组精确匹配。
+func containsRangeDeletion(list []key.RangeDeletion, t key.RangeDeletion) bool {
+	for _, x := range list {
+		if x.Seq == t.Seq && bytes.Equal(x.Start, t.Start) && bytes.Equal(x.End, t.End) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeRangeDeletions 排序 + 去重，得到全局表的标准形态。
+func normalizeRangeDeletions(list []key.RangeDeletion) []key.RangeDeletion {
+	sort.Slice(list, func(i, j int) bool {
+		if c := bytes.Compare(list[i].Start, list[j].Start); c != 0 {
+			return c < 0
+		}
+		if c := bytes.Compare(list[i].End, list[j].End); c != 0 {
+			return c < 0
+		}
+		return list[i].Seq < list[j].Seq
+	})
+	out := list[:0]
+	for i, t := range list {
+		if i > 0 && list[i-1].Seq == t.Seq && bytes.Equal(list[i-1].Start, t.Start) && bytes.Equal(list[i-1].End, t.End) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // removeFile 从有序列表里摘掉编号为 num 的文件。找不到就原样返回。

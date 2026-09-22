@@ -11,14 +11,51 @@ import (
 // ErrSnapshotReleased 表示快照已经被 Release 之后又被使用。
 var ErrSnapshotReleased = errors.New("kvdb: snapshot has been released")
 
+// ErrInvalidIteratorOptions 表示 IteratorOptions 的字段组合不合法：
+// Prefix 与 LowerBound / UpperBound 互斥，同时设置时报这个错。
+var ErrInvalidIteratorOptions = errors.New("kvdb: IteratorOptions.Prefix conflicts with LowerBound/UpperBound")
+
 // IteratorOptions 控制迭代器的扫描范围。
+//
+// 区间语义（M7 起统一为半开，与范围删除 [Start, End) 一致）：
 type IteratorOptions struct {
+	// Prefix 按前缀扫描：等价于 LowerBound = Prefix、
+	// UpperBound = Prefix 的后继（每个字节 +1 进位，全 0xFF 时无上界）。
+	//
+	// 它与 LowerBound / UpperBound 互斥，同时设置时 NewIterator 返回的
+	// 迭代器 Error() 为 ErrInvalidIteratorOptions。
+	Prefix []byte
 	// LowerBound 是扫描下界（含）。nil 表示从最小的 key 开始。
 	LowerBound []byte
-	// UpperBound 是扫描上界（含）。nil 表示一直扫到最大的 key。
+	// UpperBound 是扫描上界（**不含**）。nil 表示一直扫到最大的 key。
 	//
-	// 注意两个边界都是**闭区间**，与 LevelDB 的 ReadOptions 一致。
+	// M7 起从闭区间改为半开：范围删除本身就是半开区间（"从前缀 P 到
+	// P 的后继"），两套区间语义并存是 bug 温床，一次统一。
 	UpperBound []byte
+}
+
+// bounds 把选项翻译成内部迭代器的 (lower, upper)；返回 error 表示选项组合非法。
+func (opt *IteratorOptions) bounds() (lower, upper []byte, err error) {
+	if len(opt.Prefix) > 0 {
+		if opt.LowerBound != nil || opt.UpperBound != nil {
+			return nil, nil, ErrInvalidIteratorOptions
+		}
+		return opt.Prefix, prefixUpperBound(opt.Prefix), nil
+	}
+	return opt.LowerBound, opt.UpperBound, nil
+}
+
+// prefixUpperBound 返回前缀 p 的后继：把最后一个非 0xFF 字节 +1、其后清零。
+// 全 0xFF 时不存在后继，返回 nil 表示"扫到最大的 key 为止"。
+func prefixUpperBound(p []byte) []byte {
+	out := append([]byte(nil), p...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] != 0xFF {
+			out[i]++
+			return out[:i+1]
+		}
+	}
+	return nil
 }
 
 // Iterator 是面向 user key 的只读有序迭代器，只支持前向遍历。
@@ -98,10 +135,14 @@ func (db *DB) newIteratorLocked(snapshot uint64, opt *IteratorOptions) Iterator 
 
 	var lower, upper []byte
 	if opt != nil {
-		lower, upper = opt.LowerBound, opt.UpperBound
+		var err error
+		lower, upper, err = opt.bounds()
+		if err != nil {
+			return errIterator{err: err}
+		}
 	}
 	return &versionedIterator{
-		DBIter: iterator.NewDBIter(db.icmp, iterator.NewMerging(db.icmp, children...), snapshot, lower, upper),
+		DBIter: iterator.NewDBIter(db.icmp, iterator.NewMerging(db.icmp, children...), snapshot, lower, upper, v.RangeDeletions()),
 		db:     db,
 		v:      v,
 	}

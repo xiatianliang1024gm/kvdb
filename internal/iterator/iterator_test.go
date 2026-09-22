@@ -158,7 +158,7 @@ func TestDBIterVisibility(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			it := NewDBIter(icmp, NewMerging(icmp, newest, middle, oldest), c.snapshot, nil, nil)
+			it := NewDBIter(icmp, NewMerging(icmp, newest, middle, oldest), c.snapshot, nil, nil, nil)
 			defer it.Close()
 
 			got := map[string]string{}
@@ -210,7 +210,7 @@ func TestDBIterSeek(t *testing.T) {
 		{"b", 2, ""},   // 快照 2 时 b 还没有墓碑，但 b 也没有数据版本
 	}
 	for _, c := range cases {
-		it := NewDBIter(icmp, NewMerging(icmp, newest, middle), c.snapshot, nil, nil)
+		it := NewDBIter(icmp, NewMerging(icmp, newest, middle), c.snapshot, nil, nil, nil)
 		it.Seek([]byte(c.target))
 		got := ""
 		if it.Valid() {
@@ -223,7 +223,8 @@ func TestDBIterSeek(t *testing.T) {
 	}
 }
 
-// 上下界都是闭区间，且 Seek 到界外时要直接失效（不能退化成"扫全表"）。
+// 下界含、上界**不含**（半开，M7 起与范围删除的区间语义统一），
+// 且 Seek 到界外时要直接失效（不能退化成"扫全表"）。
 func TestDBIterBounds(t *testing.T) {
 	children := []Iterator{child(
 		rec{"a", 1, key.TypeValue, "a"},
@@ -240,7 +241,7 @@ func TestDBIterBounds(t *testing.T) {
 		if upper != "" {
 			up = []byte(upper)
 		}
-		it := NewDBIter(icmp, NewMerging(icmp, children...), 100, lo, up)
+		it := NewDBIter(icmp, NewMerging(icmp, children...), 100, lo, up, nil)
 		defer it.Close()
 		var got []string
 		if seek == "" {
@@ -254,16 +255,19 @@ func TestDBIterBounds(t *testing.T) {
 		return got
 	}
 
-	if got := collect("b", "c", ""); !equalStrings(got, []string{"b", "c"}) {
-		t.Errorf("[b, c] = %v, want [b c]", got)
+	if got := collect("b", "c", ""); !equalStrings(got, []string{"b"}) {
+		t.Errorf("[b, c) = %v, want [b]", got)
+	}
+	if got := collect("b", "d", ""); !equalStrings(got, []string{"b", "c"}) {
+		t.Errorf("[b, d) = %v, want [b c]", got)
 	}
 	if got := collect("b", "", ""); !equalStrings(got, []string{"b", "c", "d"}) {
 		t.Errorf("[b, ∞) = %v, want [b c d]", got)
 	}
-	if got := collect("", "b", ""); !equalStrings(got, []string{"a", "b"}) {
-		t.Errorf("[∞, b] = %v, want [a b]", got)
+	if got := collect("", "b", ""); !equalStrings(got, []string{"a"}) {
+		t.Errorf("[∞, b) = %v, want [a]", got)
 	}
-	// Seek 到上界之外：直接失效，不需要把剩下的都扫一遍。
+	// Seek 到上界之外（target >= upper）：直接失效，不需要把剩下的都扫一遍。
 	if got := collect("b", "c", "d"); len(got) != 0 {
 		t.Errorf("Seek(d) 超出上界 c，应当为空，实得 %v", got)
 	}
@@ -281,7 +285,7 @@ func TestDBIterNextSkipsOlderVersions(t *testing.T) {
 		rec{"a", 8, key.TypeValue, "a8"},
 		rec{"b", 7, key.TypeValue, "b7"},
 	)}
-	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil)
+	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil, nil)
 	defer it.Close()
 
 	it.SeekToFirst()
@@ -304,7 +308,7 @@ func TestDBIterKeyStabilityAndClose(t *testing.T) {
 		rec{"alpha", 2, key.TypeValue, "v1"},
 		rec{"beta", 1, key.TypeValue, "v2"},
 	)}
-	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil)
+	it := NewDBIter(icmp, NewMerging(icmp, children...), 100, nil, nil, nil)
 	it.SeekToFirst()
 
 	first := it.Key()

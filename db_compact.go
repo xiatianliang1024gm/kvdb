@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/xiatianliang1024gm/kvdb/internal/compact"
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
+	"github.com/xiatianliang1024gm/kvdb/internal/memdb"
 	"github.com/xiatianliang1024gm/kvdb/internal/sst"
 	"github.com/xiatianliang1024gm/kvdb/internal/version"
 )
@@ -61,18 +63,19 @@ func (db *DB) runCompactions() error {
 		// garbage collection 收走 —— 归并读到一半文件消失，是这类系统里
 		// 最难复现的一类崩溃。
 		res, err := compact.Run(c, v, compact.Env{
-			Dir:              db.opts.Dir,
-			ICmp:             db.icmp,
-			BlockSize:        db.opts.BlockSize,
-			BloomBitsPerKey:  db.opts.BloomBitsPerKey,
-			Compression:      db.opts.Compression.toType(),
-			RateLimiter:      db.rateLimiter,
-			TargetFileSize:   db.opts.targetFileSize(c.OutputLevel),
+			Dir:             db.opts.Dir,
+			ICmp:            db.icmp,
+			BlockSize:       db.opts.BlockSize,
+			BloomBitsPerKey: db.opts.BloomBitsPerKey,
+			Compression:     db.opts.Compression.toType(),
+			RateLimiter:     db.rateLimiter,
+			TargetFileSize:  db.opts.targetFileSize(c.OutputLevel),
 			SmallestSnapshot: snapshot,
-			Filter:           db.opts.CompactionFilter,
-			AllocFileNum:     db.vset.AllocFileNum,
-			Reader:           db.readerForMaintenance,
-			Commit:           db.commitCompaction,
+			Filter:          db.opts.CompactionFilter,
+			RangeDeletions:  v.RangeDeletions(),
+			AllocFileNum:    db.vset.AllocFileNum,
+			Reader:          db.readerForMaintenance,
+			Commit:          db.commitCompaction,
 		})
 		v.Unref()
 		if err != nil {
@@ -178,7 +181,81 @@ func (db *DB) commitCompaction(c *compact.Compaction, outputs []*version.FileMet
 		removeSSTFiles(db.opts.Dir, outputs)
 		return fmt.Errorf("kvdb: commit compaction: %w", err)
 	}
+	// 提交之后顺势判定一次范围墓碑的退休（M7）：这次 Compaction 可能刚好把
+	// 某个区间里的最后一批数据物理清掉了。退休 = 把墓碑从 Version 的全局表
+	// 里摘掉，同样要走 Manifest，但只有真的有墓碑可退时才会发生。
+	db.retireRangeTombstonesLocked()
 	return nil
+}
+
+// retireRangeTombstonesLocked 把"区间内已经没有任何数据"的范围墓碑从版本里摘掉。
+// 调用方必须持有 db.mu 的写锁。
+//
+// 一条墓碑 T 可以退休，当且仅当以下两条同时成立：
+//
+//  1. **没有存活快照需要它**：T.Seq <= 最小存活快照。快照 seq 更小的读者
+//     还要靠 T 区分"删了"和"还没删"；
+//  2. **区间内不再有任何 seq < T.Seq 的记录**，任何地方：
+//     所有层的 SST（按 user key 区间与 [T.Start, T.End) 求交）、以及
+//     MemTable / Immutable。少了这一半会出正确性问题——墓碑摘掉之后，
+//     一条还躺在某处的被遮蔽记录会"复活"。SST 侧按文件区间判定是保守的
+//     （文件里可能只有 seq > T.Seq 的新记录），代价只是退休得晚一点。
+//
+// 判定不到退休条件就什么都不做：多留一条墓碑只付 O(范围数) 的查找开销，
+// 提前退休则丢数据，两个方向的代价完全不对称。
+func (db *DB) retireRangeTombstonesLocked() {
+	snapshot := db.smallestSnapshotLocked()
+	var retired []key.RangeDeletion
+	for _, t := range db.v.RangeDeletions() {
+		if t.Seq > snapshot || db.rangeHasRecordsLocked(t) {
+			continue
+		}
+		retired = append(retired, t)
+	}
+	if len(retired) == 0 {
+		return
+	}
+	edit := db.baseEdit()
+	edit.RetiredTombstones = retired
+	if err := db.logAndApplyLocked(edit); err != nil {
+		// 退休失败不另立故障：Manifest 追加失败意味着磁盘不可信，
+		// 后续的 Flush / Compaction 会拿到同一个错误并停库。
+		db.logErrorf("retire range tombstones: %v", err)
+	}
+}
+
+// rangeHasRecordsLocked 判断区间 [t.Start, t.End) 内是否还有任何记录
+// （SST 各层 + MemTable + Immutable）。调用方必须持有 db.mu。
+func (db *DB) rangeHasRecordsLocked(t key.RangeDeletion) bool {
+	// SST：文件元信息里存的是 internal key，user 部分即文件的 key 区间。
+	// 相交判定（半开区间）：ukSmallest < t.End 且 ukLargest >= t.Start。
+	for level := 0; level < db.v.NumLevels(); level++ {
+		for _, f := range db.v.Files(level) {
+			if db.cmp.Compare(key.UserKey(f.Smallest), t.End) < 0 &&
+				db.cmp.Compare(key.UserKey(f.Largest), t.Start) >= 0 {
+				return true
+			}
+		}
+	}
+	// MemTable / Immutable：从 t.Start 起顺序扫到 t.End，看有没有
+	// seq < t.Seq 的记录。范围删除是低频操作，这段扫描的代价可以接受。
+	for _, m := range []*memdb.MemTable{db.mem, db.imm} {
+		if m == nil || m.Empty() {
+			continue
+		}
+		it := m.Seek(key.MaxSeqNum, t.Start)
+		for ; it.Valid(); it.Next() {
+			ik := it.Key()
+			uk := key.UserKey(ik)
+			if db.cmp.Compare(uk, t.End) >= 0 {
+				break
+			}
+			if key.SeqNum(ik) < t.Seq {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // recordCompaction 累计 Compaction 的规模，供 Stats 与压测输出使用。

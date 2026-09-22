@@ -26,6 +26,19 @@ const (
 	TypeDeletion Kind = 0
 	// TypeValue 是一条正常的键值写入。
 	TypeValue Kind = 1
+	// TypeMerge 预留给 M8 的 Merge 算子（docs/EXTENSIONS.md §4.3）。
+	//
+	// Kind 编号一旦写进磁盘就冻结，所以它与 TypeRangeDeletion 的编号必须
+	// 一次定死：无论两个特性谁先实现，都按同一张表占位。
+	TypeMerge Kind = 2
+	// TypeRangeDeletion 是范围墓碑（M7，docs/EXTENSIONS.md §4.1）：
+	// 半开区间 [Start, End) 内、seq 更小的记录全部不可见。
+	//
+	// 它**永不落进 SST**：范围墓碑不进 MemTable，而是随写入直接提交到
+	// Version 的全局有序表上（Manifest 持久化）。这里放进解码白名单是为了
+	// 让"记录类型"这一层对它自洽——批次的编解码、internal key 的完整性
+	// 校验都认识它。
+	TypeRangeDeletion Kind = 3
 )
 
 // String 返回类型的可读名，便于日志与测试输出。
@@ -35,9 +48,48 @@ func (k Kind) String() string {
 		return "Deletion"
 	case TypeValue:
 		return "Value"
+	case TypeMerge:
+		return "Merge"
+	case TypeRangeDeletion:
+		return "RangeDeletion"
 	default:
 		return fmt.Sprintf("Kind(%d)", uint8(k))
 	}
+}
+
+// RangeDeletion 是一条范围墓碑：半开区间 [Start, End) 内、
+// 序列号小于 Seq 的记录全部被它遮蔽（不可见）。
+//
+// 它挂在 Version 上做成一张全局有序表，不按文件存——范围数等于
+// "执行过的范围删除次数"，通常是几十量级，O(n) 线性扫的常数开销
+// 换掉一整层 per-file 状态，是划算的取舍（docs/EXTENSIONS.md 附录 C）。
+type RangeDeletion struct {
+	Start []byte
+	End   []byte
+	Seq   uint64
+}
+
+// CoveredByRange 判断 (userKey, seq) 是否被某条范围墓碑遮蔽：
+//
+//	存在 T 使 Start <= userKey < End，且 seq < T.Seq <= snapshot。
+//
+// snapshot 上界是快照隔离的一半：T.Seq > snapshot 的墓碑对该快照不可见，
+// 它要删的数据快照必须还能读到。返回 true 表示该版本对 snapshot 不可见，
+// 且同 key 更旧的版本必然也被遮蔽（遮蔽条件随 seq 减小单调成立）。
+//
+// 线性扫描是刻意的：范围数是"执行过的范围删除次数"，几十量级，
+// 一次线性扫的代价远低于为此维护区间树的复杂度。
+func CoveredByRange(ranges []RangeDeletion, ucmp func(a, b []byte) int, userKey []byte, seq, snapshot uint64) bool {
+	for i := range ranges {
+		t := &ranges[i]
+		if t.Seq <= seq || t.Seq > snapshot {
+			continue
+		}
+		if ucmp(t.Start, userKey) <= 0 && ucmp(userKey, t.End) < 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // ParsedInternalKey 是解码后的 internal key。
@@ -114,7 +166,7 @@ func DecodeInternalKey(ik []byte) (userKey []byte, seq uint64, kind Kind, err er
 	trailer := binary.BigEndian.Uint64(ik[len(ik)-TrailerLen:])
 	seq, kind = trailer>>8, Kind(trailer&0xff)
 	switch kind {
-	case TypeDeletion, TypeValue:
+	case TypeDeletion, TypeValue, TypeRangeDeletion:
 	default:
 		return nil, 0, 0, fmt.Errorf("%w: unknown kind %d", ErrCorruptInternalKey, uint8(kind))
 	}

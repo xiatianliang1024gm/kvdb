@@ -99,10 +99,19 @@ func TestDecodeInternalKeyRejectsShortInput(t *testing.T) {
 }
 
 func TestDecodeInternalKeyRejectsUnknownKind(t *testing.T) {
-	for _, kind := range []Kind{2, 3, 0xff} {
+	// 0..3 已按 docs/EXTENSIONS.md §4.3 的编号表定死（2 = Merge 预留、
+	// 3 = RangeDeletion），未定义的编号一律拒绝。
+	for _, kind := range []Kind{4, 5, 0xff} {
 		ik := EncodeInternalKey([]byte("k"), 7, kind)
 		if _, _, _, err := DecodeInternalKey(ik); !errors.Is(err, ErrCorruptInternalKey) {
 			t.Errorf("DecodeInternalKey(kind=%d) error = %v, want ErrCorruptInternalKey", kind, err)
+		}
+	}
+	// 2 与 3 是合法（或已预留）的编号，必须放行。
+	for _, kind := range []Kind{TypeRangeDeletion} {
+		ik := EncodeInternalKey([]byte("k"), 7, kind)
+		if _, _, _, err := DecodeInternalKey(ik); err != nil {
+			t.Errorf("DecodeInternalKey(kind=%d) error = %v, want nil", kind, err)
 		}
 	}
 }

@@ -79,6 +79,19 @@ func (db *DB) recover() error {
 	// 前者覆盖"日志已被清理"的部分，后者覆盖"还没进 Manifest 的最新写入"。
 	db.vset.SetLastSeq(db.lastSeq)
 
+	// 重放收集到的范围墓碑补提交到 Version。正常路径上它们已经在批次落库的
+	// 同一临界区里进过 Manifest，这里的重复提交会被按三元组去重，是幂等的；
+	// 真正兜底的是"Manifest 提交成功前进程就没了"的那一次——WAL 记录还在，
+	// 重放把墓碑补回来，范围内的数据不会复活。
+	if len(db.replayRanges) > 0 {
+		edit := db.baseEdit()
+		edit.RangeDeletions = db.replayRanges
+		if err := db.logAndApplyLocked(edit); err != nil {
+			return fmt.Errorf("kvdb: commit range deletions recovered from the wal: %w", err)
+		}
+		db.replayRanges = nil
+	}
+
 	// 迁移自 M2 的目录有一个坑：那批 SST 里的序列号可能没有任何日志记录能证明。
 	// （M2 的 lastSeq 只靠重放 WAL 恢复，而"所有 MemTable 都落盘、当前日志是空的"
 	// 这个正常时刻一旦关闭，日志里就没有记录了。）此时 lastSeq 会是 0，
@@ -170,6 +183,11 @@ func (db *DB) openCommittedFilesLocked() error {
 //
 // 序列号直接采用批次头部里的值，绝不重新分配：否则同一个目录在每次恢复后
 // 都会得到不同的版本顺序，快照语义随之崩坏。
+//
+// 范围墓碑记录不进 MemTable：与正常写入路径一致，它们最终归宿是 Version 的
+// 全局表。重放先把它们收集起来（db.replayRanges），等 Manifest 已经建好之后
+// 由 recover 统一提交——因为 WAL 重放发生在 NewManifest 之后，此刻还没有
+// 可追加的 Manifest。
 func (db *DB) applyBatch(record []byte) error {
 	b, err := decodeBatch(record)
 	if err != nil {
@@ -180,6 +198,14 @@ func (db *DB) applyBatch(record []byte) error {
 	}
 	seq := b.Sequence()
 	if err := b.rangeRecords(seq, func(seq uint64, kind key.Kind, userKey, value []byte) bool {
+		if kind == key.TypeRangeDeletion {
+			db.replayRanges = append(db.replayRanges, key.RangeDeletion{
+				Start: append([]byte(nil), userKey...),
+				End:   append([]byte(nil), value...),
+				Seq:   seq,
+			})
+			return true
+		}
 		db.mem.Add(seq, kind, userKey, value)
 		return true
 	}); err != nil {

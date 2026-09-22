@@ -39,6 +39,14 @@ type VersionEdit struct {
 	// Added / Deleted 是本次变更涉及的文件。
 	Added   []FileEdit
 	Deleted []FileEdit
+
+	// RangeDeletions 是本次新增的范围墓碑（M7，docs/EXTENSIONS.md §4.1）。
+	// 由写入路径在批次落库的同一临界区里提交，重放 Manifest 时装回版本。
+	RangeDeletions []key.RangeDeletion
+	// RetiredTombstones 是本次退休（从全局表里摘掉）的范围墓碑：
+	// 它遮蔽的数据已经全部物理消失，留着它只会白付一次查找。
+	// 退休按 (Start, End, Seq) 三元组精确匹配。
+	RetiredTombstones []key.RangeDeletion
 }
 
 // FileEdit 是 VersionEdit 里针对单个文件的变更描述。
@@ -65,7 +73,10 @@ const (
 	tagLastSeq     = 4
 	tagNewFile     = 7
 	tagDeletedFile = 9
-	tagFilterName  = 12
+	// tagRangeDeletion / tagRetiredTombstone 是 M7 的范围墓碑（新增 / 退休）。
+	tagRangeDeletion   = 10
+	tagRetiredTombstone = 11
+	tagFilterName      = 12
 )
 
 // Encode 把变更编码成一个字节串。零值字段不写入，因此"只改文件列表"的记录非常小。
@@ -103,6 +114,18 @@ func (e *VersionEdit) Encode() []byte {
 		dst = key.PutUvarint(dst, tagDeletedFile)
 		dst = key.PutUvarint(dst, uint64(f.Level))
 		dst = key.PutUvarint(dst, f.Num)
+	}
+	for _, rd := range e.RangeDeletions {
+		dst = key.PutUvarint(dst, tagRangeDeletion)
+		dst = appendBytes(dst, rd.Start)
+		dst = appendBytes(dst, rd.End)
+		dst = key.PutUvarint(dst, rd.Seq)
+	}
+	for _, rd := range e.RetiredTombstones {
+		dst = key.PutUvarint(dst, tagRetiredTombstone)
+		dst = appendBytes(dst, rd.Start)
+		dst = appendBytes(dst, rd.End)
+		dst = key.PutUvarint(dst, rd.Seq)
 	}
 	return dst
 }
@@ -161,6 +184,16 @@ func DecodeVersionEdit(buf []byte) (*VersionEdit, error) {
 				return nil, err
 			}
 			e.Deleted = append(e.Deleted, FileEdit{Level: int(level), Num: num})
+		case tagRangeDeletion, tagRetiredTombstone:
+			rd, err := r.rangeDeletion()
+			if err != nil {
+				return nil, err
+			}
+			if tag == tagRangeDeletion {
+				e.RangeDeletions = append(e.RangeDeletions, rd)
+			} else {
+				e.RetiredTombstones = append(e.RetiredTombstones, rd)
+			}
 		default:
 			return nil, fmt.Errorf("kvdb/version: unknown manifest tag %d", tag)
 		}
@@ -172,6 +205,25 @@ func DecodeVersionEdit(buf []byte) (*VersionEdit, error) {
 func (e *VersionEdit) String() string {
 	return fmt.Sprintf("VersionEdit{comparer=%q nextFileNum=%d lastSeq=%d logNum=%d +%d -%d}",
 		e.ComparatorName, e.NextFileNum, e.LastSeq, e.LogNumber, len(e.Added), len(e.Deleted))
+}
+
+// rangeDeletion 读一条范围墓碑（Start / End / Seq）。
+func (r *reader) rangeDeletion() (key.RangeDeletion, error) {
+	var rd key.RangeDeletion
+	start, err := r.bytes()
+	if err != nil {
+		return rd, err
+	}
+	if rd.End, err = r.bytes(); err != nil {
+		return rd, err
+	}
+	if rd.Seq, err = r.uvarint(); err != nil {
+		return rd, err
+	}
+	// 复制一份：r.bytes 返回的切片指向 Manifest 记录缓冲，重放下一条就被覆盖。
+	rd.Start = append([]byte(nil), start...)
+	rd.End = append([]byte(nil), rd.End...)
+	return rd, nil
 }
 
 // appendBytes 追加"长度前缀 + 内容"。

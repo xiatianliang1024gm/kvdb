@@ -145,7 +145,7 @@ func TestGetRespectsSnapshotAndTombstone(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v, kind, found, err := r.Get(tt.snapshot, []byte(tt.k))
+			v, kind, _, found, err := r.Get(tt.snapshot, []byte(tt.k))
 			if err != nil {
 				t.Fatalf("Get failed: %v", err)
 			}
@@ -174,11 +174,11 @@ func TestGetValueIsStable(t *testing.T) {
 
 	for _, c := range []*cache.Cache{nil, cache.New(1 << 20)} {
 		r := openReader(t, path, c, 42)
-		first, _, _, err := r.Get(1, []byte("a"))
+		first, _, _, _, err := r.Get(1, []byte("a"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, _, err := r.Get(1, []byte("b")); err != nil {
+		if _, _, _, _, err := r.Get(1, []byte("b")); err != nil {
 			t.Fatal(err)
 		}
 		if string(first) != "alpha" {
@@ -224,7 +224,7 @@ func TestMultiBlockFile(t *testing.T) {
 	// 点查：每个 key 的最新版本都要命中。
 	for k := 0; k < 300; k++ {
 		uk := fmt.Sprintf("k%04d", k)
-		v, _, found, err := r.Get(1<<40, []byte(uk))
+		v, _, _, found, err := r.Get(1<<40, []byte(uk))
 		if err != nil {
 			t.Fatalf("Get(%s) failed: %v", uk, err)
 		}
@@ -338,7 +338,7 @@ func TestPointLookupReadsASingleBlock(t *testing.T) {
 	// 命中的 key：恰好读入 1 个数据块。
 	for _, k := range []string{"k0000", "k0050", "k0100", "k0199"} {
 		before := c.Stats().Misses
-		if _, _, found, err := r.Get(1<<40, []byte(k)); err != nil || !found {
+		if _, _, _, found, err := r.Get(1<<40, []byte(k)); err != nil || !found {
 			t.Fatalf("Get(%s) = (found=%v, err=%v)", k, found, err)
 		}
 		if got := c.Stats().Misses - before; got != 1 {
@@ -350,7 +350,7 @@ func TestPointLookupReadsASingleBlock(t *testing.T) {
 	before := c.Stats().Misses
 	const probes = 1000
 	for i := 0; i < probes; i++ {
-		if _, _, found, err := r.Get(1<<40, []byte(fmt.Sprintf("absent-%06d", i))); err != nil || found {
+		if _, _, _, found, err := r.Get(1<<40, []byte(fmt.Sprintf("absent-%06d", i))); err != nil || found {
 			t.Fatalf("不存在的 key 被读到了: found=%v err=%v", found, err)
 		}
 	}
@@ -375,11 +375,11 @@ func TestFilterIsOptional(t *testing.T) {
 	}
 	for i := 0; i < 50; i++ {
 		uk := fmt.Sprintf("k%04d", i)
-		a, _, fa, err := noFilter.Get(1<<40, []byte(uk))
+		a, _, _, fa, err := noFilter.Get(1<<40, []byte(uk))
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, _, fb, err := withFilter.Get(1<<40, []byte(uk))
+		b, _, _, fb, err := withFilter.Get(1<<40, []byte(uk))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -398,7 +398,7 @@ func TestCacheServesRepeatedReads(t *testing.T) {
 	for round := 0; round < 3; round++ {
 		for k := 0; k < 100; k++ {
 			uk := fmt.Sprintf("k%04d", k)
-			v, _, found, err := r.Get(1<<40, []byte(uk))
+			v, _, _, found, err := r.Get(1<<40, []byte(uk))
 			if err != nil || !found || string(v) != "v0" {
 				t.Fatalf("第 %d 轮 Get(%s) = (%q, found=%v, err=%v)", round, uk, v, found, err)
 			}
@@ -426,7 +426,7 @@ func TestCorruptDataBlockDetected(t *testing.T) {
 	}
 
 	r := openReader(t, path, nil, 1)
-	_, _, _, err = r.Get(1<<40, []byte("k0000"))
+	_, _, _, _, err = r.Get(1<<40, []byte("k0000"))
 	if !errors.Is(err, ErrCorruptBlock) {
 		t.Fatalf("Get 的 error = %v, want ErrCorruptBlock", err)
 	}
@@ -543,7 +543,7 @@ func TestEmptyFile(t *testing.T) {
 	if n, err := r.Count(); err != nil || n != 0 {
 		t.Fatalf("Count() = %d, %v; want 0", n, err)
 	}
-	if _, _, found, err := r.Get(1, []byte("a")); err != nil || found {
+	if _, _, _, found, err := r.Get(1, []byte("a")); err != nil || found {
 		t.Fatalf("Get on empty file = (found=%v, err=%v), want (false, nil)", found, err)
 	}
 	it := r.NewIterator()
@@ -618,14 +618,14 @@ func TestLargeValue(t *testing.T) {
 	if r.NumBlocks() != 2 {
 		t.Errorf("NumBlocks() = %d, want 2", r.NumBlocks())
 	}
-	v, _, found, err := r.Get(1, []byte("a"))
+	v, _, _, found, err := r.Get(1, []byte("a"))
 	if err != nil || !found {
 		t.Fatalf("Get failed: found=%v err=%v", found, err)
 	}
 	if !bytes.Equal(v, big) {
 		t.Fatalf("大 value 读回不一致：%d vs %d 字节", len(v), len(big))
 	}
-	if v, _, found, _ := r.Get(1, []byte("b")); !found || string(v) != "small" {
+	if v, _, _, found, _ := r.Get(1, []byte("b")); !found || string(v) != "small" {
 		t.Fatal("大 value 之后读不到后续记录")
 	}
 	// 遍历也要能跨过大 value。

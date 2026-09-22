@@ -332,10 +332,11 @@ func (r *Reader) seekIndex(target []byte) (blockHandle, bool, error) {
 //
 // 返回的 value 与 kind 语义与 M1 一致：found 为 false 表示"这个文件里没有该 key
 // 在 snapshot 下的可见版本"（可能是没有这个 key，也可能是它的所有版本都更新），
-// 调用方应当继续查更旧的文件。
-func (r *Reader) Get(snapshot uint64, userKey []byte) (value []byte, kind key.Kind, found bool, err error) {
+// 调用方应当继续查更旧的文件。seq 是命中版本的序列号，供范围墓碑（M7）
+// 判"这条记录是否被某条范围删除遮蔽"。
+func (r *Reader) Get(snapshot uint64, userKey []byte) (value []byte, kind key.Kind, seq uint64, found bool, err error) {
 	if r.numBlocks == 0 {
-		return nil, 0, false, nil
+		return nil, 0, 0, false, nil
 	}
 	// 定位用的 key 带 (snapshot, TypeValue) 尾缀：尾缀降序排列下，所有比快照更新的
 	// 版本都排在它前面，因此 seek 的落点恰好是该快照下最新的可见版本。
@@ -343,30 +344,30 @@ func (r *Reader) Get(snapshot uint64, userKey []byte) (value []byte, kind key.Ki
 
 	h, ok, err := r.seekIndex(target)
 	if err != nil || !ok {
-		return nil, 0, false, err
+		return nil, 0, 0, false, err
 	}
 	// 先问 Bloom，再读块：这一步挡掉的就是"根本不存在这个 key"的无效 IO。
 	if !r.filter.KeyMayMatch(h.offset, userKey) {
-		return nil, 0, false, nil
+		return nil, 0, 0, false, nil
 	}
 
 	block, err := r.readBlock(h)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, 0, false, err
 	}
 	it, err := newBlockIter(block, r.icmp.Compare)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("%s: %w", r.path, err)
+		return nil, 0, 0, false, fmt.Errorf("%s: %w", r.path, err)
 	}
 	it.Seek(target)
 	if !it.Valid() {
-		return nil, 0, false, it.Error()
+		return nil, 0, 0, false, it.Error()
 	}
 	// 落点换了 user key，说明目标 key 在这个文件里没有可见版本。
 	if r.icmp.UserCompare(it.Key(), target) != 0 {
-		return nil, 0, false, nil
+		return nil, 0, 0, false, nil
 	}
-	return it.Value(), key.KindOf(it.Key()), true, nil
+	return it.Value(), key.KindOf(it.Key()), key.SeqNum(it.Key()), true, nil
 }
 
 // Iterate 顺序遍历全部记录，fn 返回 false 时提前结束。

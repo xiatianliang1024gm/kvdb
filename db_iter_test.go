@@ -214,11 +214,25 @@ func TestIteratorSeekAndBounds(t *testing.T) {
 		t.Fatal("Seek(z) 应当失效")
 	}
 
-	// 闭区间上下界。
-	bounded := db.NewIterator(&IteratorOptions{LowerBound: []byte("c"), UpperBound: []byte("e")})
+	// 半开区间：下界含，上界不含（M7 起的统一语义）。
+	bounded := db.NewIterator(&IteratorOptions{LowerBound: []byte("c"), UpperBound: []byte("f")})
 	if got := keysOf(t, bounded); !equalSlices(got, []string{"c", "e"}) {
 		t.Fatalf("带边界的迭代 = %v, want [c e]", got)
 	}
+
+	// Prefix 与边界互斥。
+	conflict := db.NewIterator(&IteratorOptions{Prefix: []byte("c"), UpperBound: []byte("f")})
+	if err := conflict.Error(); !errors.Is(err, ErrInvalidIteratorOptions) {
+		t.Fatalf("Prefix + UpperBound 应当报 ErrInvalidIteratorOptions，实得 %v", err)
+	}
+	conflict.Close()
+
+	// Prefix 扫描：等价于 [prefix, prefix 的后继)。
+	prefixed := db.NewIterator(&IteratorOptions{Prefix: []byte("a")})
+	if got := keysOf(t, prefixed); !equalSlices(got, []string{"a"}) {
+		t.Fatalf("Prefix(a) 迭代 = %v, want [a]", got)
+	}
+	prefixed.Close()
 }
 
 // Get 返回的必须是一份独立的数据：调用方修改它不能影响库里的内容。

@@ -2,6 +2,7 @@ package version
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/xiatianliang1024gm/kvdb/internal/key"
 	"github.com/xiatianliang1024gm/kvdb/internal/wal"
 )
 
@@ -187,6 +189,9 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 	levels := make([][]*FileMeta, vs.cfg.MaxLevels)
 	recordedName := ""
 	recordedFilterName := ""
+	// 范围墓碑（M7）：随每条记录增量收集，循环结束后统一套用退休、排序去重。
+	var rangeDels []key.RangeDeletion
+	var retiredRanges []key.RangeDeletion
 	r := wal.NewReader(f)
 	for {
 		record, rerr := r.ReadRecord()
@@ -234,7 +239,23 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 			}
 			levels[a.Level] = insertFile(levels[a.Level], fileFromEdit(a.Level, a), vs.icmp, a.Level == 0)
 		}
+		rangeDels = append(rangeDels, e.RangeDeletions...)
+		retiredRanges = append(retiredRanges, e.RetiredTombstones...)
 	}
+
+	// 范围墓碑：先套用退休记录再归一化（排序 + 去重）。去重在这里同样必要 ——
+	// "Manifest 提交成功但 WAL 未截断"的重放会把同一条墓碑交上来两次。
+	nv := &Version{vset: vs, levels: levels}
+	for _, t := range retiredRanges {
+		for i := range rangeDels {
+			if rangeDels[i].Seq == t.Seq && bytes.Equal(rangeDels[i].Start, t.Start) && bytes.Equal(rangeDels[i].End, t.End) {
+				rangeDels = append(rangeDels[:i], rangeDels[i+1:]...)
+				break
+			}
+		}
+	}
+	nv.rangeDels = normalizeRangeDeletions(rangeDels)
+	nv.Ref()
 
 	if recordedName != "" && recordedName != vs.comparerName {
 		return truncated, fmt.Errorf(
@@ -251,8 +272,6 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 			recordedFilterName, vs.filterName)
 	}
 
-	nv := &Version{vset: vs, levels: levels}
-	nv.Ref()
 	old := vs.current
 	vs.live = append(vs.live, nv)
 	vs.current = nv
@@ -335,6 +354,12 @@ func (vs *VersionSet) snapshotEditLocked() *VersionEdit {
 		for _, fm := range files {
 			edit.Added = append(edit.Added, fm.Edit(level))
 		}
+	}
+	// 范围墓碑挂的是全局表而不是文件，快照编辑必须把它一并带上——
+	// 否则每次打开时"收敛历史记录成新 Manifest"会把已提交的范围删除弄丢。
+	if n := len(vs.current.rangeDels); n > 0 {
+		edit.RangeDeletions = make([]key.RangeDeletion, n)
+		copy(edit.RangeDeletions, vs.current.rangeDels)
 	}
 	return edit
 }

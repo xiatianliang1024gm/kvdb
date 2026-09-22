@@ -1,6 +1,7 @@
 package kvdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +31,8 @@ var (
 	ErrBatchCorrupt = errors.New("kvdb: corrupt write batch")
 	// ErrBatchTooLarge 表示单个批次超过了单条 WAL 记录允许的上限。
 	ErrBatchTooLarge = fmt.Errorf("kvdb: write batch exceeds %d bytes", MaxBatchBytes)
+	// ErrInvalidRange 表示 DeleteRange 的区间不合法（end <= start 的半开区间是空的）。
+	ErrInvalidRange = errors.New("kvdb: DeleteRange requires end > start")
 )
 
 // MaxBatchBytes 是单个 WriteBatch 编码后的上限。
@@ -79,6 +82,31 @@ func (b *WriteBatch) Delete(userKey []byte) error {
 	return b.addRecord(key.TypeDeletion, userKey, nil)
 }
 
+// DeleteRange 追加一条范围删除：半开区间 [start, end) 内的所有键全部不可见。
+//
+// 它**不**逐键写墓碑，而是写一条范围墓碑记录（key = start，value = end）：
+// 一条记录覆盖任意大的区间，成本与区间内的键数无关——这是 SQL 的
+// DROP TABLE / TRUNCATE 和 Redis 的 DEL 大 key 能成立的前提。
+//
+// 语义要点（docs/EXTENSIONS.md §4.1）：
+//   - 可见性立即生效：返回后范围内所有键读不到、迭代器扫不到，对之前取的
+//     快照仍可见；
+//   - 物理回收发生在后续 Compaction，删除后磁盘占用不会立刻下降；
+//   - end <= start 是空区间，返回 ErrInvalidRange 而不是静默无事发生——
+//     那几乎总是调用方的 bug（比如算错了前缀的后继）。
+func (b *WriteBatch) DeleteRange(start, end []byte) error {
+	if len(start) == 0 || len(end) == 0 {
+		return ErrEmptyKey
+	}
+	// 比较器语义下 start >= end 都算空区间；这里用字节序即可——
+	// 自定义 Comparer 也必须与字节序在"前缀包含"上同向，否则整个引擎
+	// 的区间运算（SST 文件区间、Compaction 选择）都不成立。
+	if bytes.Compare(start, end) >= 0 {
+		return ErrInvalidRange
+	}
+	return b.addRecord(key.TypeRangeDeletion, start, end)
+}
+
 // addRecord 把一条记录追加到记录区。
 func (b *WriteBatch) addRecord(kind key.Kind, userKey, value []byte) error {
 	if len(userKey) == 0 {
@@ -90,12 +118,19 @@ func (b *WriteBatch) addRecord(kind key.Kind, userKey, value []byte) error {
 	b.data = append(b.data, byte(kind))
 	b.data = key.PutUvarint(b.data, uint64(len(userKey)))
 	b.data = append(b.data, userKey...)
-	if kind == key.TypeValue {
+	if hasValue(kind) {
 		b.data = key.PutUvarint(b.data, uint64(len(value)))
 		b.data = append(b.data, value...)
 	}
 	b.count++
 	return nil
+}
+
+// hasValue 表示该记录类型的编码里是否带 value 字段。
+//
+// 范围墓碑是"非 Value 记录也带 value"的唯一一种：value 存的是区间终点 End。
+func hasValue(kind key.Kind) bool {
+	return kind == key.TypeValue || kind == key.TypeRangeDeletion
 }
 
 // Encode 返回批次的完整编码（头部 + 记录区）。
@@ -135,7 +170,7 @@ func (b *WriteBatch) rangeRecords(start uint64, fn func(seq uint64, kind key.Kin
 		rest = rest[klen:]
 
 		var value []byte
-		if kind == key.TypeValue {
+		if hasValue(kind) {
 			vlen, vn, err := key.Uvarint(rest)
 			if err != nil {
 				return fmt.Errorf("%w: value length: %v", ErrBatchCorrupt, err)
@@ -177,7 +212,7 @@ func decodeBatch(rep []byte) (*WriteBatch, error) {
 			return nil, fmt.Errorf("%w: record %d/%d missing", ErrBatchCorrupt, i+1, count)
 		}
 		kind := key.Kind(rest[0])
-		if kind != key.TypeValue && kind != key.TypeDeletion {
+		if kind != key.TypeValue && kind != key.TypeDeletion && kind != key.TypeRangeDeletion {
 			return nil, fmt.Errorf("%w: unknown kind %d", ErrBatchCorrupt, uint8(kind))
 		}
 		klen, n, err := key.Uvarint(rest[1:])
@@ -189,7 +224,7 @@ func decodeBatch(rep []byte) (*WriteBatch, error) {
 			return nil, fmt.Errorf("%w: key claims %d bytes, %d left", ErrBatchCorrupt, klen, len(rest))
 		}
 		rest = rest[klen:]
-		if kind == key.TypeValue {
+		if hasValue(kind) {
 			vlen, vn, err := key.Uvarint(rest)
 			if err != nil {
 				return nil, fmt.Errorf("%w: value length: %v", ErrBatchCorrupt, err)

@@ -4,7 +4,7 @@
 >
 > 本文只写"还缺什么、怎么补"；**kvdb 现有的功能以 `docs/DESIGN.md` 为准**，两份文档不重叠。
 >
-> 状态：M6（§4.2 CompactionFilter）已实施 ｜ 最后更新：2026-09-22
+> 状态：M6（§4.2 CompactionFilter）与 M7（§4.1 DeleteRange + §5.1 半开上界/Prefix）已实施 ｜ 最后更新：2026-09-22
 
 ## 目录
 

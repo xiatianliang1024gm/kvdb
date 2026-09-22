@@ -249,7 +249,7 @@ func TestCompressionRoundTrip(t *testing.T) {
 		}
 
 		// 点查同样要正确（走的是"索引二分 → 读块 → 块内 seek"）。
-		v, kind, found, err := r.Get(uint64(len(entries)+10), []byte(keyOf(7)))
+		v, kind, _, found, err := r.Get(uint64(len(entries)+10), []byte(keyOf(7)))
 		if err != nil {
 			t.Fatalf("%v: Get: %v", typ, err)
 		}
@@ -309,7 +309,7 @@ func TestCompressionSkippedWhenNotWorthIt(t *testing.T) {
 
 	var bs BlockStats
 	r := openWithStats(t, path, nil, 1, &bs)
-	if _, _, _, err := r.Get(1<<20, []byte(keyOf(42))); err != nil {
+	if _, _, _, _, err := r.Get(1<<20, []byte(keyOf(42))); err != nil {
 		t.Fatal(err)
 	}
 	snap := bs.Snapshot()
@@ -440,7 +440,7 @@ func TestCacheStoresDecompressedBlocks(t *testing.T) {
 	r := openWithStats(t, path, c, 7, &bs)
 
 	// 第一次：块缓存是空的，读一个块必然要解压。
-	if _, _, _, err := r.Get(1<<20, []byte(keyOf(900))); err != nil {
+	if _, _, _, _, err := r.Get(1<<20, []byte(keyOf(900))); err != nil {
 		t.Fatal(err)
 	}
 	first := bs.Snapshot().Decompressions
@@ -450,7 +450,7 @@ func TestCacheStoresDecompressedBlocks(t *testing.T) {
 
 	// 重复读同一个 key：缓存里若是解压后的内容，就不该再解压一次。
 	for i := 0; i < 5; i++ {
-		if _, _, _, err := r.Get(1<<20, []byte(keyOf(900))); err != nil {
+		if _, _, _, _, err := r.Get(1<<20, []byte(keyOf(900))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -461,7 +461,7 @@ func TestCacheStoresDecompressedBlocks(t *testing.T) {
 	// 换一个不带缓存的读取器再读一次：必须重新解压，
 	// 说明上面的"没解压"确实来自缓存而不是别的原因。
 	uncached := openWithStats(t, path, nil, 7, &bs)
-	if _, _, _, err := uncached.Get(1<<20, []byte(keyOf(900))); err != nil {
+	if _, _, _, _, err := uncached.Get(1<<20, []byte(keyOf(900))); err != nil {
 		t.Fatal(err)
 	}
 	if got := bs.Snapshot().Decompressions; got <= first {
@@ -490,7 +490,7 @@ func TestUnsupportedCompressionTypeRejected(t *testing.T) {
 	r := openWithStats(t, path, nil, 1, &BlockStats{})
 	// Open 只读 Index / Filter / MetaIndex 三个元数据块，所以坏的是数据块时
 	// 打开仍然成功，故障要等到真的去读那一个块才暴露。
-	_, _, _, err := r.Get(1<<20, []byte(keyOf(0)))
+	_, _, _, _, err := r.Get(1<<20, []byte(keyOf(0)))
 	if err == nil {
 		t.Fatal("未知压缩类型的块应当读失败")
 	}
@@ -519,7 +519,7 @@ func TestCorruptCompressedBlockDetected(t *testing.T) {
 	}
 
 	r := openWithStats(t, path, nil, 1, &BlockStats{})
-	_, _, _, err := r.Get(1<<20, []byte(keyOf(0)))
+	_, _, _, _, err := r.Get(1<<20, []byte(keyOf(0)))
 	if err == nil {
 		t.Fatal("损坏的压缩块应当被拒绝")
 	}
@@ -539,7 +539,7 @@ func TestUncompressedFilesStayReadable(t *testing.T) {
 	var bs BlockStats
 	r := openWithStats(t, path, nil, 1, &bs)
 	for _, k := range []string{keyOf(0), keyOf(150), keyOf(299)} {
-		v, _, found, err := r.Get(1<<20, []byte(k))
+		v, _, _, found, err := r.Get(1<<20, []byte(k))
 		if err != nil || !found {
 			t.Fatalf("Get(%s): found=%v err=%v", k, found, err)
 		}

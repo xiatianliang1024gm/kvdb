@@ -816,7 +816,8 @@ func doScan(cfg config, db *kvdb.DB, res *result) error {
 	for i := 0; i < cfg.scans; i++ {
 		from := rnd.Intn(starts)
 		opt.LowerBound = key(from)
-		opt.UpperBound = key(from + span - 1)
+		// M7 起上界是半开的（不含），直接指向区间后第一个 key。
+		opt.UpperBound = key(from + span)
 
 		it := db.NewIterator(opt)
 		n := 0

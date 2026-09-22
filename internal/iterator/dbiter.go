@@ -4,13 +4,15 @@ import "github.com/xiatianliang1024gm/kvdb/internal/key"
 
 // DBIter 在归并流之上呈现 user key 级别的有序视图。
 //
-// 它负责三件归并流不该管的事：
+// 它负责四件归并流不该管的事：
 //
 //  1. **快照可见性**：seq > snapshot 的版本直接丢弃；
 //  2. **同 key 去重**：同一个 user key 只输出该快照下最新的那个版本；
-//  3. **墓碑遮蔽**：最新可见版本是墓碑时，这个 key 整个不输出。
+//  3. **墓碑遮蔽**：最新可见版本是墓碑时，这个 key 整个不输出；
+//  4. **范围墓碑遮蔽**（M7）：最新可见版本落在某条范围删除的区间内且比它旧时，
+//     同样整个不输出。
 //
-// 这三件事能做得这么轻，是因为归并流保证"同一个 user key 的版本按 seq 降序相邻排列"：
+// 这四件事能做得这么轻，是因为归并流保证"同一个 user key 的版本按 seq 降序相邻排列"：
 // 只要顺着扫，遇到的第一个 seq <= snapshot 的记录就是可见版本。
 type DBIter struct {
 	mi   Iterator
@@ -19,6 +21,10 @@ type DBIter struct {
 
 	snapshot     uint64
 	lower, upper []byte
+	// ranges 是范围墓碑表（M7）：命中一条可见记录后还要判一次
+	// "是否被某条范围删除遮蔽"。它由构造方（DB）从当前版本取来，
+	// 与归并流里的 SST 同属一个版本快照，读的过程中不变。
+	ranges []key.RangeDeletion
 
 	// savedKey 是"当前输出的 user key"的副本。
 	//
@@ -31,7 +37,8 @@ type DBIter struct {
 }
 
 // NewDBIter 在 mi 之上构造 user key 级迭代器。mi 的每个子迭代器必须按"新的在前"排列。
-func NewDBIter(icmp key.InternalComparer, mi Iterator, snapshot uint64, lower, upper []byte) *DBIter {
+// ranges 是当前版本的范围墓碑表（没有范围删除时传 nil）。
+func NewDBIter(icmp key.InternalComparer, mi Iterator, snapshot uint64, lower, upper []byte, ranges []key.RangeDeletion) *DBIter {
 	return &DBIter{
 		mi:       mi,
 		icmp:     icmp,
@@ -39,6 +46,7 @@ func NewDBIter(icmp key.InternalComparer, mi Iterator, snapshot uint64, lower, u
 		snapshot: snapshot,
 		lower:    lower,
 		upper:    upper,
+		ranges:   ranges,
 	}
 }
 
@@ -101,7 +109,9 @@ func (it *DBIter) Seek(target []byte) {
 	if it.lower != nil && it.ucmp(target, it.lower) < 0 {
 		target = it.lower
 	}
-	if it.upper != nil && it.ucmp(target, it.upper) > 0 {
+	// 上界是**半开**的（不含）：与范围墓碑 [Start, End) 的区间语义统一。
+	// target >= upper 时整个扫描区间为空，直接失效。
+	if it.upper != nil && it.ucmp(target, it.upper) >= 0 {
 		it.valid = false
 		return
 	}
@@ -138,13 +148,22 @@ func (it *DBIter) findNextUserEntry(skipping bool) {
 		ik := it.mi.Key()
 		uk := key.UserKey(ik)
 
-		if it.upper != nil && it.ucmp(uk, it.upper) > 0 {
-			return // 越过上界，本次扫描结束
+		// 越上半开上界，本次扫描结束。
+		if it.upper != nil && it.ucmp(uk, it.upper) >= 0 {
+			return
 		}
 
 		if key.SeqNum(ik) <= it.snapshot {
 			switch key.KindOf(ik) {
 			case key.TypeValue:
+				// 被范围墓碑遮蔽与被单键墓碑删除同构：这条记录不可见，
+				// 且同 key 更旧的版本必然也被遮蔽（遮蔽条件随 seq 减小单调成立），
+				// 所以整段跳过。
+				if key.CoveredByRange(it.ranges, it.ucmp, uk, key.SeqNum(ik), it.snapshot) {
+					it.savedKey = append(it.savedKey[:0], uk...)
+					skipping = true
+					break
+				}
 				if !skipping || it.ucmp(uk, it.savedKey) > 0 {
 					it.savedKey = append(it.savedKey[:0], uk...)
 					it.valid = true

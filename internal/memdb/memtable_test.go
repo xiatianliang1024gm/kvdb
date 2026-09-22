@@ -17,12 +17,12 @@ func TestMemTableGetRespectsSnapshot(t *testing.T) {
 	m.Add(3, key.TypeValue, []byte("k"), []byte("v3"))
 
 	// 快照 0 表示"什么都没写"，看不到任何版本。
-	if _, _, found := m.Get(0, []byte("k")); found {
+	if _, _, _, found := m.Get(0, []byte("k")); found {
 		t.Error("snapshot 0 不应该看到任何版本")
 	}
 	want := map[uint64]string{1: "v1", 2: "v2", 3: "v3", 99: "v3"}
 	for snapshot, expected := range want {
-		v, kind, found := m.Get(snapshot, []byte("k"))
+		v, kind, _, found := m.Get(snapshot, []byte("k"))
 		if !found {
 			t.Errorf("snapshot %d: found = false, want true", snapshot)
 			continue
@@ -42,11 +42,11 @@ func TestMemTableGetSeesDeletion(t *testing.T) {
 	m.Add(1, key.TypeValue, []byte("k"), []byte("v1"))
 	m.Add(2, key.TypeDeletion, []byte("k"), nil)
 
-	if v, kind, found := m.Get(1, []byte("k")); !found || kind != key.TypeValue || string(v) != "v1" {
+	if v, kind, _, found := m.Get(1, []byte("k")); !found || kind != key.TypeValue || string(v) != "v1" {
 		t.Fatalf("snapshot 1: (%q, %v, %v), want (v1, Value, true)", v, kind, found)
 	}
 	for _, snapshot := range []uint64{2, 3} {
-		_, kind, found := m.Get(snapshot, []byte("k"))
+		_, kind, _, found := m.Get(snapshot, []byte("k"))
 		if !found {
 			t.Fatalf("snapshot %d: found = false, 墓碑必须被命中", snapshot)
 		}
@@ -57,7 +57,7 @@ func TestMemTableGetSeesDeletion(t *testing.T) {
 
 	// 删除后重新写入，新值可见、墓碑被遮蔽。
 	m.Add(3, key.TypeValue, []byte("k"), []byte("v2"))
-	if v, kind, found := m.Get(3, []byte("k")); !found || kind != key.TypeValue || string(v) != "v2" {
+	if v, kind, _, found := m.Get(3, []byte("k")); !found || kind != key.TypeValue || string(v) != "v2" {
 		t.Fatalf("重新写入后 snapshot 3: (%q, %v, %v), want (v2, Value, true)", v, kind, found)
 	}
 }
@@ -69,12 +69,12 @@ func TestMemTableGetMiss(t *testing.T) {
 	m.Add(2, key.TypeValue, []byte("d"), []byte("vd"))
 
 	for _, k := range []string{"a", "c", "e", "", "bb", "zzz"} {
-		if _, _, found := m.Get(10, []byte(k)); found {
+		if _, _, _, found := m.Get(10, []byte(k)); found {
 			t.Errorf("Get(%q) found = true, want false", k)
 		}
 	}
 	// 字符串前缀相近但不是同一个 key：不能因为共享前缀而误命中。
-	if _, _, found := m.Get(10, []byte("d")); !found {
+	if _, _, _, found := m.Get(10, []byte("d")); !found {
 		t.Errorf("Get(\"d\") 应命中")
 	}
 }
@@ -88,7 +88,7 @@ func TestMemTableAddCopiesInput(t *testing.T) {
 	k[0] = 'X'
 	v[0] = 'Y'
 
-	got, _, found := m.Get(1, []byte("key"))
+	got, _, _, found := m.Get(1, []byte("key"))
 	if !found {
 		t.Fatal("Get 未命中")
 	}

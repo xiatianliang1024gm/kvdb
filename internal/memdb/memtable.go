@@ -67,20 +67,23 @@ func (m *MemTable) Add(seq uint64, kind key.Kind, userKey, value []byte) {
 //   - found 为 false：这张表里没有该 key 在 snapshot 下的可见版本，调用方应继续查下层；
 //   - found 为 true 且 kind 为 TypeDeletion：命中墓碑，key 已被删除，调用方应停止下探；
 //   - found 为 true 且 kind 为 TypeValue：命中数据。
-func (m *MemTable) Get(snapshot uint64, userKey []byte) (value []byte, kind key.Kind, found bool) {
+//
+// seq 是命中版本的序列号：范围墓碑（M7）要拿它判"这条记录是否落在某条
+// 墓碑的区间里且比墓碑旧"，没有 seq 就没法做这个判定。
+func (m *MemTable) Get(snapshot uint64, userKey []byte) (value []byte, kind key.Kind, seq uint64, found bool) {
 	// SeekKey 的尾缀是 (snapshot, TypeValue)，尾缀降序下它排在
 	// "seq <= snapshot 的全部版本"之前，因此 seek 落点就是最新可见版本。
 	it := m.skl.NewIterator()
 	it.Seek(key.SeekKey(userKey, snapshot))
 	if !it.Valid() {
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	ik := it.Key()
 	if m.cmp.Compare(key.UserKey(ik), userKey) != 0 {
 		// 该 user key 在 snapshot 下没有可见版本，落点已经跑到下一个 key 上了。
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
-	return it.Value(), key.KindOf(ik), true
+	return it.Value(), key.KindOf(ik), key.SeqNum(ik), true
 }
 
 // NewIterator 返回遍历全部 internal key 的前向迭代器，供 Flush 落盘使用。

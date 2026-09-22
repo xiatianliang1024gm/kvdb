@@ -18,6 +18,7 @@ coverage.txt
 /tmp/
 /_probe.txt
 /_*.log
+/_*.py
 
 # WorkBuddy 的工作区数据（会话记录、memory 等），不进版本库
 /.workbuddy/

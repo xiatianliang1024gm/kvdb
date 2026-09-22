@@ -600,8 +600,9 @@ type Iterator interface {          // 面向 user key 的只读有序迭代器�
 }
 
 type IteratorOptions struct {
+    Prefix     []byte              // M7：前缀扫描；与 Lower/UpperBound 互斥
     LowerBound []byte              // 含
-    UpperBound []byte              // 含；与 LevelDB 的 ReadOptions 一致，是闭区间
+    UpperBound []byte              // **不含**（M7 起改为半开，与范围删除的区间语义统一）
 }
 
 // Snapshot 是接口而非结构体：struct 版字段全非导出，包外造不出 *Snapshot，

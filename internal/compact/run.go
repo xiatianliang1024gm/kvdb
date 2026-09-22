@@ -74,6 +74,16 @@ type Env struct {
 	// 大面积失效 —— 这与"快照钉住 GC"是同一件事的两个面。
 	Filter Filter
 
+	// RangeDeletions 是当前版本的范围墓碑表（M7，只读）。归并循环用它做两件事：
+	//
+	//   - **遮蔽丢弃**：seq <= SmallestSnapshot 的记录若被某条墓碑盖住
+	//     （record.seq < T.Seq <= SmallestSnapshot），整条丢掉、连墓碑都不用写——
+	//     墓碑本身挂在 Version 上，对更深层的旧数据继续生效。这是范围删除
+	//     唯一真正回收空间的时刻；
+	//   - 退休不在 Run 里做：能否退休取决于"区间内是否还有数据"，而 MemTable
+	//     与 DB 的当前版本只有 DB 知道，由 commitCompaction 提交后统一判定。
+	RangeDeletions []key.RangeDeletion
+
 	// AllocFileNum 分配一个新的文件编号。
 	AllocFileNum func() uint64
 	// Reader 返回一个已提交文件号的读取器。
@@ -227,6 +237,15 @@ func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 			continue
 		}
 		if key.SeqNum(ik) <= env.SmallestSnapshot {
+			// 范围墓碑遮蔽（M7）：在 covered 判定**之前**检查。被盖住的记录
+			// 对所有现存与未来的读者都不可见（seq < T.Seq <= SmallestSnapshot），
+			// 整条丢掉。不能置 covered：那条语义是"这个 key 的答案已经写出去了"，
+			// 而这里什么都没写——后续同 key 记录还会逐条走到这个分支，
+			// 它们同样被盖住（遮蔽条件随 seq 减小单调成立），同样丢掉。
+			if key.CoveredByRange(env.RangeDeletions, env.ICmp.CompareUser, uk, key.SeqNum(ik), env.SmallestSnapshot) {
+				res.DroppedRecords++
+				continue
+			}
 			covered = true
 			kind := key.KindOf(ik)
 			if env.Filter != nil && kind == key.TypeValue {

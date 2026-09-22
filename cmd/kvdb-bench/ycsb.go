@@ -247,7 +247,8 @@ func runYCSB(cfg config) error {
 				}
 				opt := &kvdb.IteratorOptions{}
 				opt.LowerBound = ycsbKey(k)
-				opt.UpperBound = ycsbKey(k + length - 1)
+				// M7 起上界是半开的（不含），直接指向区间后第一个 key。
+				opt.UpperBound = ycsbKey(k + length)
 				opStart = time.Now()
 				it := db.NewIterator(opt)
 				n := 0

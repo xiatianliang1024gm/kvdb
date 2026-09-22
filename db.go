@@ -105,6 +105,11 @@ type DB struct {
 	// 代价是"忘记 Release"会让 Compaction 变保守（旧版本清不掉），而不是出错。
 	snapshots map[uint64]int
 
+	// replayRanges 暂存 WAL 重放期间收集到的范围墓碑（M7）。
+	// 只在 recover() 内部使用：重放发生在 NewManifest 之后，墓碑要等
+	// Manifest 可追加后才能提交到 Version，见 db_flush.go 的 applyBatch。
+	replayRanges []key.RangeDeletion
+
 	report RecoveryReport
 
 	// blockStats 累计块压缩在读写两侧的规模，Flush / Compaction 的 Writer 与
@@ -251,6 +256,13 @@ type Stats struct {
 	// 不会读错数据，但旧版本会一直留在磁盘上。
 	LiveSnapshots int
 
+	// RangeTombstones 是当前版本上还挂着的范围墓碑条数（M7）。
+	//
+	// 一条范围墓碑在"它遮蔽的区间内不再有任何数据"时由 Compaction 自动退休，
+	// 这个数随之归零。长期不为零通常意味着区间内还有更深层的旧数据没被
+	// Compaction 触及，而不是出了问题。
+	RangeTombstones int
+
 	// ── M5：块压缩与限流 ────────────────────────────────────────────
 	//
 	// Compression 把"写出去多少、省下来多少"变成可验证的数字：
@@ -317,12 +329,13 @@ func (db *DB) Stats() Stats {
 		memSize = db.mem.ApproximateSize()
 	}
 	s := Stats{
-		Files:         v.FileCount(),
-		MemTableSize:  memSize,
-		HasImmutable:  db.imm != nil,
-		LastSequence:  db.lastSeq,
-		LiveSnapshots: len(db.snapshots),
-		Levels:        levels,
+		Files:           v.FileCount(),
+		MemTableSize:    memSize,
+		HasImmutable:    db.imm != nil,
+		LastSequence:    db.lastSeq,
+		LiveSnapshots:   len(db.snapshots),
+		RangeTombstones: v.RangeDeletionCount(),
+		Levels:          levels,
 		Compaction: CompactionStats{
 			Count:          db.counters.compactions.Load(),
 			InputFiles:     db.counters.compactionInputFiles.Load(),
@@ -571,6 +584,25 @@ func (db *DB) Delete(userKey []byte) error {
 	return db.Write(b)
 }
 
+// DeleteRange 删除半开区间 [start, end) 内的所有键（M7）。
+//
+// 一条范围墓碑覆盖任意大的区间，成本与区间内的键数无关——SQL 的
+// DROP TABLE / TRUNCATE 和 Redis 的 DEL 大 key 都建立在这上面。
+//
+// 语义与单键 Delete 的差别只在物理回收的时机：可见性立即生效（返回后
+// 范围内的键读不到、迭代器扫不到，之前的快照不受影响），但空间回收要等
+// 后续 Compaction 把被遮蔽的记录真正重写掉；Compaction 还会在"区间内
+// 再无任何数据"时自动退休这条墓碑（Stats.RangeTombstones 归零）。
+// end <= start 返回 ErrInvalidRange。
+func (db *DB) DeleteRange(start, end []byte) error {
+	b := batchPool.Get().(*WriteBatch)
+	defer putBatch(b)
+	if err := b.DeleteRange(start, end); err != nil {
+		return err
+	}
+	return db.Write(b)
+}
+
 func putBatch(b *WriteBatch) {
 	b.Reset()
 	batchPool.Put(b)
@@ -605,14 +637,24 @@ func (db *DB) Get(userKey []byte) ([]byte, error) {
 // SST 新；SST 之间先看 L0（从新到旧），再看 L1 以下（每层最多一个候选）。
 // 第一个命中的层次（哪怕是墓碑）就是答案。
 //
+// 命中之后还有最后一道判据（M7）：**范围墓碑遮蔽**。命中的版本若落在某条
+// 范围删除的区间内、且比它旧（seq < T.Seq <= snapshot），整个 key 对这个
+// 快照不可见——同 key 更旧的版本必然也被遮蔽，不用继续下探，直接 NotFound。
+//
 // 返回的切片由内部缓冲区持有，调用方不得修改。
 func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
-	if v, kind, found := db.mem.Get(snapshot, userKey); found {
-		return valueOf(v, kind)
+	if val, kind, seq, found := db.mem.Get(snapshot, userKey); found {
+		if db.v.RangeCovers(userKey, seq, snapshot) {
+			return nil, ErrNotFound
+		}
+		return valueOf(val, kind)
 	}
 	if db.imm != nil {
-		if v, kind, found := db.imm.Get(snapshot, userKey); found {
-			return valueOf(v, kind)
+		if val, kind, seq, found := db.imm.Get(snapshot, userKey); found {
+			if db.v.RangeCovers(userKey, seq, snapshot) {
+				return nil, ErrNotFound
+			}
+			return valueOf(val, kind)
 		}
 	}
 
@@ -620,11 +662,14 @@ func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
 	// L0 的文件区间互相重叠，只能从新到旧逐个试。
 	l0 := v.Files(0)
 	for i := len(l0) - 1; i >= 0; i-- {
-		val, kind, found, err := db.probeFile(l0[i].Num, snapshot, userKey)
+		val, kind, seq, found, err := db.probeFile(l0[i].Num, snapshot, userKey)
 		if err != nil {
 			return nil, err
 		}
 		if found {
+			if v.RangeCovers(userKey, seq, snapshot) {
+				return nil, ErrNotFound
+			}
 			return valueOf(val, kind)
 		}
 	}
@@ -637,11 +682,14 @@ func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
 			if f == nil {
 				continue
 			}
-			val, kind, found, err := db.probeFile(f.Num, snapshot, userKey)
+			val, kind, seq, found, err := db.probeFile(f.Num, snapshot, userKey)
 			if err != nil {
 				return nil, err
 			}
 			if found {
+				if v.RangeCovers(userKey, seq, snapshot) {
+					return nil, ErrNotFound
+				}
 				return valueOf(val, kind)
 			}
 		}
@@ -650,10 +698,10 @@ func (db *DB) getLocked(snapshot uint64, userKey []byte) ([]byte, error) {
 }
 
 // probeFile 在编号为 num 的 SST 里查一次，并记录读放大。
-func (db *DB) probeFile(num, snapshot uint64, userKey []byte) (value []byte, kind key.Kind, found bool, err error) {
+func (db *DB) probeFile(num, snapshot uint64, userKey []byte) (value []byte, kind key.Kind, seq uint64, found bool, err error) {
 	r, err := db.readerFor(num)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, 0, false, err
 	}
 	db.counters.readProbes.Add(1)
 	return r.Get(snapshot, userKey)
