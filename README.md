@@ -240,7 +240,7 @@ flowchart TD
 ├── batch.go         WriteBatch
 ├── options.go       Options / Comparer / Compression / Logger
 ├── cmd/kvdb-bench/  压测工具
-├── docs/            DESIGN.md（权威设计文档）· BENCH.md（基准报告）
+├── docs/            DESIGN.md（权威设计文档）· BENCH.md（基准报告）· EXTENSIONS.md（上层扩展设计）
 └── internal/
     ├── key      internal key 编码与比较器      ├── sst       SSTable 读写与块格式
     ├── memdb    跳表 MemTable                  ├── filter    Bloom Filter
@@ -273,6 +273,7 @@ Windows 上跑 `-race` 需要 cgo（MSYS2 的 gcc）；仓库里 `scripts/gotest
 
 - [docs/DESIGN.md](docs/DESIGN.md) —— 权威设计文档：边界、读写路径、文件格式、功能清单、六个里程碑的交付物与验收结果、关键决策记录。
 - [docs/BENCH.md](docs/BENCH.md) —— 基准报告，由 `kvdb-bench -report` 生成。
+- [docs/EXTENSIONS.md](docs/EXTENSIONS.md) —— 上层扩展设计：为在 kvdb 上封装关系型引擎与 Redis 协议存储所需的能力增补（范围删除、Compaction 过滤器、Merge 算子、提交期校验等）。**尚未实施**。
 
 ## 状态
 
