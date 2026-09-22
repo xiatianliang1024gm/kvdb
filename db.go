@@ -632,6 +632,69 @@ func (db *DB) Get(userKey []byte) ([]byte, error) {
 	return copyValue(v), nil
 }
 
+// GetForUpdate 与 Get 语义相同，额外返回可见版本的序列号（M9）。
+//
+// seq 是提交期校验的关键：上层事务读时记下 (key, seq)，提交时在 WriteChecked
+// 的 check 里比对。校验从"重读并比对字节"降成"比一个 uint64"，而且能检测
+// "改了又改回来"—— seq 随每次写入单调递增、同一版本的 seq 唯一，所以
+// "seq 相同 = 版本相同"是可靠的。命中 merge 链时返回的是折叠值的 seq，
+// 即最新 operand 的序列号：之后再落一个 operand，seq 必然不同，照样能查出冲突。
+//
+// seq == 0 表示 key 不存在（从未写过、已被删除、被范围墓碑遮蔽都算）——
+// "不存在"同样是可校验的状态：提交时 key 若已变成存在（seq 必非 0），
+// check 就能发现。已知盲区：并发的 DeleteRange 不产生可见版本，两次
+// seq == 0 之间夹着一次范围删除是查不出来的，用范围删除的层要自己加锁。
+//
+// 它与 Snapshot 一样不进 api.go 的 Reader 接口：事务原语是 kvdb 特有能力，
+// 塞进"抽象 kvdb 的最小面"会抬高所有替代实现的门槛。
+func (db *DB) GetForUpdate(userKey []byte) (value []byte, seq uint64, err error) {
+	if len(userKey) == 0 {
+		return nil, 0, ErrEmptyKey
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, 0, ErrClosed
+	}
+	db.counters.gets.Add(1)
+	return db.getForUpdateLocked(db.lastSeq, userKey)
+}
+
+// getForUpdateLocked 在指定快照下读取可见值与其序列号，供 GetForUpdate 使用。
+//
+// 与 getLocked 走同一条路（seekVisibleLocked → 范围遮蔽 → merge 折叠），
+// 区别只在终点：不存在的三种形态（没命中、命中墓碑、被范围遮蔽）统一折叠成
+// (nil, 0)，存在的形态带着命中版本的 seq 返回。
+func (db *DB) getForUpdateLocked(snapshot uint64, userKey []byte) ([]byte, uint64, error) {
+	val, kind, hitSeq, err := db.seekVisibleLocked(snapshot, userKey)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	// 与 getLocked 同一条判据：被范围墓碑盖住 ⇒ 这个快照下 key 不存在。
+	if db.v.RangeCovers(userKey, hitSeq, snapshot) {
+		return nil, 0, nil
+	}
+	if kind == key.TypeMerge {
+		val, err = db.foldMergeLocked(snapshot, userKey, hitSeq, val)
+		if err != nil {
+			return nil, 0, err
+		}
+		return copyValue(val), hitSeq, nil
+	}
+	val, err = valueOf(val, kind) // 命中墓碑 ⇒ ErrNotFound ⇒ 不存在
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	return copyValue(val), hitSeq, nil
+}
+
 // getLocked 在指定快照下读取 userKey 的可见值。
 //
 // 先定位最新可见版本（seekVisibleLocked，快速路径不付任何额外代价），

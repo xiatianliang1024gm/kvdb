@@ -4,8 +4,8 @@
 >
 > 本文只写"还缺什么、怎么补"；**kvdb 现有的功能以 `docs/DESIGN.md` 为准**，两份文档不重叠。
 >
-> 状态：M6（§4.2 CompactionFilter）、M7（§4.1 DeleteRange + §5.1 半开上界/Prefix）
-> 与 M8（§4.3 Merge 算子）已实施 ｜ 最后更新：2026-09-22
+> 状态：M6（§4.2 CompactionFilter）、M7（§4.1 DeleteRange + §5.1 半开上界/Prefix）、
+> M8（§4.3 Merge 算子）与 M9（§4.4 提交期校验原语）已实施 ｜ 最后更新：2026-09-22
 
 ## 目录
 
@@ -262,8 +262,10 @@ func (db *DB) WriteChecked(b *WriteBatch, check func() error) error
 
 - **`GetForUpdate` 的 seq 是校验的关键**：上层事务读时记下 `(key, seq)`，提交时在 `check` 里比对 seq。校验从"重读并比对字节"降成"比一个 uint64"，而且能检测"改了又改回来"（seq 必然递增）。seq 是每次写入单调递增的，同一 key 的版本 seq 唯一，所以"seq 相同 = 版本相同"是可靠的。
 - **`check` 放在 WAL 追加之前。** 事务回滚不该在 WAL 里留下任何痕迹。
-- **`WriteChecked` 的批次不参与组提交合并，独占一个提交组。** 理由：现有语义是"整组同生共死，任一批次出错 ⇒ 整组失败 + 停库"（`db_write.go:215-226`），而事务 abort 是正常控制流，不是故障。把带 check 的批次混进普通组，会让一次正常 abort 演变成停库。**代价必须写明：事务提交拿不到组提交的 fsync 摊销。** 这也意味着上层应当把"显式事务提交"当低频操作，把"单语句自动提交"当高频操作（后者走普通 `Write`，照常享受摊销）。
-  - 后续可优化为"组内混排、逐个 check、失败的批次单独标记 abort 而整组继续"，能保住摊销。先做独占组，语义最清晰。
+- **`WriteChecked` 的批次不与普通批次合并，独占一个提交段。** 理由：现有语义是"整组同生共死，任一批次出错 ⇒ 整组失败 + 停库"（`db_write.go:215-226`），而事务 abort 是正常控制流，不是故障。把带 check 的批次混进普通组，会让一次正常 abort 演变成停库。**代价必须写明：事务提交拿不到组提交的 fsync 摊销。** 这也意味着上层应当把"显式事务提交"当低频操作，把"单语句自动提交"当高频操作（后者走普通 `Write`，照常享受摊销）。
+- **实施注记（M9）**：独占段做成了"组内切段"——队长收集队列后按 check 把组切成若干段（`splitChecked`），普通段照旧合并提交，每个 checked 批次独占一段，段间在同一队长任期内顺序执行。这比"整个批次单独排队"保住了普通写者的 fsync 摊销，等价于原设想里留作后续的"组内混排、失败的批次单独 abort 而整组继续"。
+- **check 运行时不持 `db.mu`**（原设想的"beginWriteGroup 的 db.mu 临界区内跑 check"不成立）：check 的本职是重读读集（`GetForUpdate` 要拿 `db.mu.RLock`），先锁 `db.mu` 再跑 check 就是自己锁死自己。原子窗口改由**队长的独占性**给出——同一时刻只有一个队长在提交，"check 通过 → 本批落库"之间其他写者全在队列里；读者在此窗口进不进来与写写冲突检测无关。
+- **check 的 panic 转成 error 返回**（`runCheck`）：队长若带着 panic 退场，`wleader` 永不清零，全体写者永远等不到结论。转成 error 后这次提交正常失败、队长正常让位，比"靠 defer 释放锁"更强——根本没有锁需要释放。
 - **不进 `api.go` 的 `Reader` / `Writer` 接口。** 那三个接口是"抽象 kvdb 的最小面"，事务原语是 kvdb 特有的能力，塞进去会抬高所有替代实现（测试假库、装饰器）的门槛。
 
 **这不是在引擎里实现事务。** 隔离级别、读写集管理、回滚、死锁检测全在上层；引擎只提供"原子地校验并提交"这一个原语。这与 DESIGN §8「不做事务隔离级别 / SSI」不冲突——那里拒绝的是"引擎实现隔离级别"，这里做的是"让上层能自己实现"。
@@ -272,17 +274,15 @@ func (db *DB) WriteChecked(b *WriteBatch, check func() error) error
 
 | 文件 | 改动 |
 |---|---|
-| `db.go` | `GetForUpdate`（内部复用 `getLocked`，额外取 seq） |
-| `db_write.go` | `WriteChecked`：在 `beginWriteGroup` 的 `db.mu` 临界区内跑 check；失败则整批返回该 error 且不停库 |
-| `internal/memdb` | `MemTable.Get` 需要同时返回可见版本的 seq（现在只返回 value + kind） |
-| `internal/sst` | `Reader.Get` 同上 |
+| `db.go` | `GetForUpdate`（复用 `seekVisibleLocked` → 范围遮蔽 → merge 折叠的既有链路，取命中 seq） |
+| `db_write.go` | `WriteChecked`：批次带 check 入队；队长切段（`splitChecked`/`commitSegment`/`commitChecked`），checked 段先跑 check（不持 `db.mu`，见实施注记），失败只失败自己、不停库 |
 
 **验收**
 
 - 两个并发事务改同一 key：只有一个成功，另一个 check 失败且数据未被修改。
 - check 失败后 `Stats.WALBytes` 不增长——直接验证"没写 WAL"。
 - check 失败不影响其他写者（引擎不停库，后续 `Write` 正常）。
-- check 内 panic 不会锁死 `db.mu`（锁由 `defer` 释放）。
+- check 内 panic 不挂写队列（转为 error，队长正常让位，库照常可用）。
 
 ---
 

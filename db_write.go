@@ -32,8 +32,13 @@ import (
 type writeRequest struct {
 	batch *WriteBatch
 	seq   uint64 // 起始序列号，由队长分配
-	err   error  // 由队长在 completeWriteGroup 里填
+	err   error  // 由队长在 finishWriteGroup 里填
 	done  bool
+	// check 非 nil 表示这是 M9 的"提交期校验"批次（WriteChecked）。它不能和
+	// 普通批次混在同一段提交里：普通组是"整组同生共死 + 停库"，而 check
+	// 失败是正常的事务 abort（只失败自己、不停库）。队长收集队列后会按
+	// check 把组切成若干段，每个带 check 的批次独占一段（见 splitChecked）。
+	check func() error
 }
 
 // Write 原子地写入一个批次，是引擎唯一的写入口。
@@ -102,13 +107,82 @@ func (db *DB) Write(b *WriteBatch) error {
 	// （这个丢失唤醒实测会稳定挂死，栈上表现为一堆 goroutine 卡在 wcond.Wait
 	// 而场上没有队长。）所以"还要不要继续当队长"必须和"清空 wleader"
 	// 放在同一个 wmu 临界区里判断。
+	db.leadWrites()
+	return req.err
+}
+
+// WriteChecked 在"提交的同一窗口"里先跑 check 再决定是否写入本批（M9）。
+//
+// 它是上层实现快照隔离与唯一约束的最小原语：事务读时用 GetForUpdate 记下
+// 每个读集 key 的 (key, seq)，提交时把"比对 seq"写进 check。check 返回
+// nil 才写入，返回 error 则整批不写 —— 引擎不停库、WAL 不留痕，调用方拿到
+// 的 error 就是"校验失败，请重试"。
+//
+// # 为什么 check 不能放进 db.mu 临界区
+//
+// check 的本职就是重读读集，而读要拿 db.mu.RLock；如果引擎先锁住 db.mu
+// 再跑 check，读集校验就是自己锁死自己。真正的原子性由**队长的独占性**
+// 给出：同一时刻只有一个队长在提交，check 通过到本批落库之间，其他写者
+// 全部在队列里，没有任何提交能插进来 —— 读写冲突检测要挡的本就是并发写，
+// 读者在这个窗口里进不进来无关紧要。
+//
+// # 与组提交的关系
+//
+// 带 check 的批次独占一个提交段（不与普通批次合并），check 失败只失败自己：
+// 事务 abort 是正常控制流，混进"整组同生共死"的普通组里，一次正常 abort
+// 就会演变成停库。代价是事务提交拿不到组提交的 fsync 摊销 —— 上层应当把
+// 显式事务提交当低频操作，单语句自动提交照走普通 Write。
+//
+// check 的 panic 被转成 error 返回（见 runCheck），不会挂住写队列；
+// check 为 nil 时退化为普通 Write。空批次与 Write 一致：直接返回 nil，
+// 连 check 都不跑 —— 没有写入就没有需要守护的提交。
+func (db *DB) WriteChecked(b *WriteBatch, check func() error) error {
+	if b == nil || b.Len() == 0 {
+		return nil
+	}
+	// 与 Write 同一条前置校验：批次里有 merge 记录但没配算子，写之前就拒绝。
+	if b.hasMerge && db.opts.MergeOperator == nil {
+		return ErrNoMergeOperator
+	}
+	if check == nil {
+		return db.Write(b)
+	}
+	req := &writeRequest{batch: b, check: check}
+
+	db.wmu.Lock()
+	if db.wclosing {
+		db.wmu.Unlock()
+		return ErrClosed
+	}
+	db.wqueue = append(db.wqueue, req)
+	if db.wleader {
+		// 已有队长在提交：排进队列等它做到我们这一段。队长会按 check
+		// 把组切段，我们的 check 会在它自己的提交段里运行。
+		for !req.done {
+			db.wcond.Wait()
+		}
+		err := req.err
+		db.wmu.Unlock()
+		return err
+	}
+	db.wleader = true
+	db.wmu.Unlock()
+
+	db.leadWrites()
+	return req.err
+}
+
+// leadWrites 是队长的主循环：反复收集队列、切段提交，直到队列彻底空了才让位。
+//
+// "要不要让位"的判断在 finishWriteGroup 里与清空 wleader 同一个临界区完成，
+// 理由见 Write 里那段"丢失唤醒"的注释。
+func (db *DB) leadWrites() {
 	for {
-		group, err := db.runWriteGroup()
-		if !db.finishWriteGroup(group, err) {
-			break
+		group := db.takeWriteGroup()
+		if !db.commitWriteGroup(group) {
+			return
 		}
 	}
-	return req.err
 }
 
 // collectYields 是队长在开始 fsync 之前"让出调度"的次数，用来把**已经就绪**的
@@ -124,15 +198,12 @@ func (db *DB) Write(b *WriteBatch) error {
 // 每档 3000 次写）把合并率从 15.9 提到 22.4~27.8，即吞吐再涨四到七成。
 const collectYields = 4
 
-// runWriteGroup 是组提交的实现：把当前队列合并成一次 WAL 追加 + 一次 fsync，
-// 然后落进 MemTable。
-//
-// 返回整组的结论与参与本组的写者列表 —— 发结论是调用方的事，因为"谁是队长"
-// 由 Write 决定，这里只负责提交。
-func (db *DB) runWriteGroup() ([]*writeRequest, error) {
+// takeWriteGroup 是组提交的收集步：把当前队列取空，再用几次"让出调度"把
+// 刚刚就绪的写者收进本组（见 collectYields 的注释）。
+func (db *DB) takeWriteGroup() []*writeRequest {
 	group := db.takeWriteQueue()
 	if len(group) == 0 {
-		return nil, nil
+		return nil
 	}
 	for i := 0; i < collectYields; i++ {
 		runtime.Gosched()
@@ -140,26 +211,104 @@ func (db *DB) runWriteGroup() ([]*writeRequest, error) {
 			group = append(group, extra...)
 		}
 	}
+	return group
+}
 
-	// ① 分配序列号 + 固定日志句柄。
-	//
-	// 序列号就写在 WAL 记录头里，必须先定下来；但这时**不能**抬高 db.lastSeq ——
-	// 它同时是读者的快照水位，提前抬高会让读者看到一个尚未落地的"已提交点"。
-	// 反正同一时刻只有这一组在飞，db.lastSeq 停在组前是安全的。
+// commitWriteGroup 提交一段收集到的队列，并把结论发给其中每个写者。
+//
+// 返回队长是否还要继续 —— 队列里又有人排着就继续当，没人就让位。
+//
+// 组里混着带 check 的批次（M9）时，整组不能一把提交：普通组是"整组同生共死
+// + 停库"，而 check 失败是正常的事务 abort。所以先把组按 check 切成段，
+// 逐段提交、逐段发结论 —— 段与段之间在同一个队长任期内顺序执行，其他写者
+// 插不进来，"check 通过 → 本批可见"的原子窗口依然成立。
+func (db *DB) commitWriteGroup(group []*writeRequest) bool {
+	if len(group) == 0 {
+		return db.finishWriteGroup(nil, nil)
+	}
+	for _, segment := range splitChecked(group) {
+		db.completeSegment(segment, db.commitSegment(segment))
+	}
+	return db.finishWriteGroup(nil, nil)
+}
+
+// splitChecked 把收集到的队列按"带 check 的批次"切段：普通批次继续合并成组
+// 享受 fsync 摊销，每个带 check 的批次独占一段。段的先后顺序保持入队顺序，
+// 所以先入队的普通批次先提交，后到的 checked 批次的 check 能看到它们的写入。
+func splitChecked(group []*writeRequest) [][]*writeRequest {
+	segments := make([][]*writeRequest, 0, 2)
+	var cur []*writeRequest
+	flush := func() {
+		if len(cur) > 0 {
+			segments = append(segments, cur)
+			cur = nil
+		}
+	}
+	for _, r := range group {
+		if r.check != nil {
+			flush()
+			segments = append(segments, []*writeRequest{r})
+			continue
+		}
+		cur = append(cur, r)
+	}
+	flush()
+	return segments
+}
+
+// commitSegment 提交一个段：分配序列号 → WAL 追加 + 一次 fsync → 落库。
+//
+// 只有一个写者的 checked 段走 commitChecked（它要先跑 check）；
+// 普通段就是原来的三步组提交。
+func (db *DB) commitSegment(segment []*writeRequest) error {
+	if len(segment) == 1 && segment[0].check != nil {
+		return db.commitChecked(segment[0])
+	}
+	firstSeq, lastSeq, log, err := db.beginWriteGroup(segment)
+	if err != nil {
+		return err
+	}
+	err = db.appendWriteGroup(log, segment)
+	return db.applyWriteGroup(segment, firstSeq, lastSeq, err)
+}
+
+// commitChecked 提交一个带提交期校验的批次（M9）。
+//
+// check 在 WAL 追加**之前**运行：事务 abort 不该在 WAL 里留下任何痕迹。
+// 它刻意**不持 db.mu** —— 此刻队长身份已经把其他写者全部挡在队列里，
+// "check 通过 → 本批落库"之间不会有任何其他提交插入，这正是校验需要的
+// 原子窗口；而 check 要做的恰恰是重读读集（GetForUpdate），那个读要拿
+// db.mu.RLock —— 先把 db.mu 锁住再跑 check，就是自己锁死自己。
+//
+// check 失败 ⇒ 整批不写、返回该 error、**不停库**：事务 abort 是正常控制流，
+// 与"磁盘故障 ⇒ 停库"是两回事。代价是本批独占一次 fsync，拿不到组提交的
+// 摊销 —— 上层应当把显式事务提交当低频操作，单语句自动提交照走普通 Write。
+func (db *DB) commitChecked(req *writeRequest) error {
+	if err := runCheck(req.check); err != nil {
+		return err
+	}
+	group := []*writeRequest{req}
 	firstSeq, lastSeq, log, err := db.beginWriteGroup(group)
 	if err != nil {
-		return group, err
+		return err
 	}
-
-	// ② 追加 + fsync。整条写路径里最贵的一步，刻意放在 db.mu 之外：
-	//    读者在这一步里完全不受影响。
-	//
-	//    这里不必担心 db.log 被换掉 —— 换日志只发生在 freezeLocked 里，
-	//    而 freezeLocked 只由队长调用，队长同一时刻只有一个。
 	err = db.appendWriteGroup(log, group)
+	return db.applyWriteGroup(group, firstSeq, lastSeq, err)
+}
 
-	// ③ 落盘成功才动内存：读者看到的每一个序列号都必须是已经持久化的。
-	return group, db.applyWriteGroup(group, firstSeq, lastSeq, err)
+// runCheck 运行提交期校验，把 check 的 panic 转成 error。
+//
+// 校验代码是上层逻辑，不能让它把写队列炸挂：队长要是带着 panic 退场，
+// wleader 永远不清零，全体写者就永远等不到结论。转成 error 之后这次提交
+// 正常失败、队长正常让位，库照常运转（验收要求的"panic 不锁死"由此成立，
+// 而且比"靠 defer 释放锁"更进一步 —— 根本没有锁需要释放）。
+func runCheck(check func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("kvdb: write check panicked: %v", r)
+		}
+	}()
+	return check()
 }
 
 // beginWriteGroup 为整组分配连续的序列号，并固定这一组要写的那份日志。
@@ -304,6 +453,23 @@ func (db *DB) takeWriteQueue() []*writeRequest {
 	group := db.wqueue
 	db.wqueue = nil
 	return group
+}
+
+// completeSegment 把一个提交段的结论发给段内每个写者。
+//
+// 它刻意**不动 wleader**：队长可能还有后续段要提交，而 finishWriteGroup 的
+// "队列空 ⇒ 让位"一旦在段间触发，新写者就会在上一任队长还在飞的时候抢走
+// 队长身份，两边并发分配序列号 —— 同一个 seq 会被写两次（MemTable 的重复
+// internal key panic 就是这么来的）。队长去留只允许在全部段都提交完之后，
+// 由 commitWriteGroup 末尾的 finishWriteGroup 判定一次。
+func (db *DB) completeSegment(segment []*writeRequest, err error) {
+	db.wmu.Lock()
+	for _, r := range segment {
+		r.err = err
+		r.done = true
+	}
+	db.wcond.Broadcast()
+	db.wmu.Unlock()
 }
 
 // finishWriteGroup 发掉这一组的结论，并告诉队长还要不要继续。
