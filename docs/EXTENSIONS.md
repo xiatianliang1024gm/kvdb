@@ -4,7 +4,7 @@
 >
 > 本文只写"还缺什么、怎么补"；**kvdb 现有的功能以 `docs/DESIGN.md` 为准**，两份文档不重叠。
 >
-> 状态：设计稿，未实施 ｜ 最后更新：2026-09-22
+> 状态：M6（§4.2 CompactionFilter）已实施 ｜ 最后更新：2026-09-22
 
 ## 目录
 
@@ -141,7 +141,8 @@ type CompactionFilter interface {
     // Name 写进 Manifest 用于校验目录与配置是否匹配，语义同 Comparer.Name。
     Name() string
     // Filter 判定一条记录是否还要留下。level 是**输出层**，seq 是记录序列号。
-    Filter(level int, userKey, value []byte, seq uint64) Decision
+    // 返回 error ⇒ 本次 Compaction 整体失败并停库（验收要求，签名因此带 error）。
+    Filter(level int, userKey, value []byte, seq uint64) (Decision, error)
 }
 
 type Decision int  // Keep / Drop（先不做 Change）
@@ -401,7 +402,7 @@ func (b *WriteBatch) DeleteRange(start, end []byte) error   // 半开 [start, en
 // ── 4.2 Compaction 过滤器
 type CompactionFilter interface {
     Name() string
-    Filter(level int, userKey, value []byte, seq uint64) Decision
+    Filter(level int, userKey, value []byte, seq uint64) (Decision, error)
 }
 type Decision int
 const (Keep Decision = iota; Drop)
@@ -486,6 +487,7 @@ db 编号 key 首字节前再加一字节 db 索引
 | filter 只对 `seq <= SmallestSnapshot` 生效 | 否则破坏快照隔离。代价：老快照会让 filter 大面积失效 |
 | Flush 侧默认不挂 filter | 把用户回调插在前台关键路径上，等于把引擎延迟暴露给用户代码 |
 | filter / merge 的 `Name()` 写进 Manifest 校验 | 与 Comparer 同级别：换语义读老目录会造成"该丢的没丢、不该丢的丢了" |
+| 过滤器名**记过之后才冻结**：老目录可首次配过滤器，但换名/去掉都会被拒 | M6 之前的 Manifest 没有这个名字，"首次引入"不改变任何既有数据的判定；而"换掉一个已在生效的过滤器"才是真正的事故 |
 | Kind 编号一次定死：2 = Merge，3 = RangeDeletion | 编号一旦落盘就冻结；两个特性无论谁先做都要按同一张表占位 |
 | `covered` 只在遇到 Value/Deletion 时置位 | Merge operand 必须收集齐才能丢，沿用原规则会丢掉还没折叠的 operand |
 | 要求 Merge 算子满足结合律 | `PartialMerge` 的结果会再参与折叠，不满足结合律会与 `FullMerge` 结果不一致，而引擎无法替上层发现 |

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/xiatianliang1024gm/kvdb/internal/cache"
+	"github.com/xiatianliang1024gm/kvdb/internal/compact"
 	"github.com/xiatianliang1024gm/kvdb/internal/key"
 	"github.com/xiatianliang1024gm/kvdb/internal/memdb"
 	"github.com/xiatianliang1024gm/kvdb/internal/sst"
@@ -332,10 +333,13 @@ func (db *DB) flushLoop() {
 				break
 			}
 			num := db.vset.AllocFileNum()
+			// 快照上界必须在此处（持锁时）取好：Flush 的过滤只对
+			// "seq <= 最小存活快照"的记录生效，与 Compaction 同一条规则。
+			snapshot := db.smallestSnapshotLocked()
 			db.mu.Unlock()
 
 			// ── 锁外：写文件 + 打开读取器 ──
-			meta, err := db.flushMemTable(imm, num)
+			meta, err := db.flushMemTable(imm, num, snapshot)
 			var reader *sst.Reader
 			if err == nil && meta != nil {
 				if reader, err = db.openReader(meta.Num); err != nil {
@@ -396,7 +400,9 @@ func (db *DB) flushLoop() {
 // 旧日志才能被删除，而"删日志"是这一步的直接目的。
 func (db *DB) flushRecoveredLocked() error {
 	num := db.vset.AllocFileNum()
-	meta, err := db.flushMemTable(db.mem, num)
+	// 恢复路径此刻没有任何存活快照，上界就是重放出来的 lastSeq：
+	// 全部记录都在"最新可见版本"的判定范围内。
+	meta, err := db.flushMemTable(db.mem, num, db.smallestSnapshotLocked())
 	if err != nil {
 		return err
 	}
@@ -426,9 +432,21 @@ func (db *DB) flushRecoveredLocked() error {
 //
 // 它不修改任何共享状态，因此可以在不持锁的情况下慢慢跑；
 // 文件"写完"的标志就是这里返回了非 nil 的 meta。
-func (db *DB) flushMemTable(m *memdb.MemTable, num uint64) (*version.FileMeta, error) {
+//
+// smallestSnapshot 是"还可能有读者的最小序列号"：FilterOnFlush 打开时，
+// 过滤器只对每个 user key 的"最新可见版本"（seq <= smallestSnapshot 的第一条，
+// 且类型为 TypeValue）调用一次 —— 与 Compaction 侧同一条规则、同一套快照隔离
+// 依据。判为 Drop 的记录写一条**同序列号的墓碑**而不是直接跳过：更深层可能还
+// 躺着这个 key 的旧版本，跳过会让它在 Flush 之后复活。注意 MemTable 与 WAL 里
+// 的原始记录不受影响：崩溃重放可能让数据临时回来一次，过滤是幂等的，
+// 下次 Flush 会再次清掉。
+func (db *DB) flushMemTable(m *memdb.MemTable, num uint64, smallestSnapshot uint64) (*version.FileMeta, error) {
 	if m.Empty() {
 		return nil, nil
+	}
+	var filter compact.Filter
+	if db.opts.FilterOnFlush {
+		filter = db.opts.CompactionFilter
 	}
 	path := sst.FilePath(db.opts.Dir, num)
 	w, err := sst.NewWriter(path, db.cmp, sst.WriterOptions{
@@ -441,9 +459,41 @@ func (db *DB) flushMemTable(m *memdb.MemTable, num uint64) (*version.FileMeta, e
 		return nil, err
 	}
 	var first, last []byte
+	var lastUserKey []byte
+	// bounded 与 Compaction 的 covered 同构：当前 user key 的"最新可见版本"
+	// 已经处理过。MemTable 迭代按 user key 升序、同 key 内 seq 降序排列，
+	// 所以每 key 只需判定一次。
+	bounded := false
 	it := m.NewIterator()
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		ik := it.Key()
+		uk := key.UserKey(ik)
+		if lastUserKey == nil || db.cmp.Compare(uk, lastUserKey) != 0 {
+			lastUserKey = append(lastUserKey[:0], uk...)
+			bounded = false
+		}
+		if !bounded && key.SeqNum(ik) <= smallestSnapshot {
+			bounded = true
+			if filter != nil && key.KindOf(ik) == key.TypeValue {
+				d, ferr := filter.Filter(0, uk, it.Value(), key.SeqNum(ik))
+				if ferr != nil {
+					w.Abandon()
+					return nil, fmt.Errorf("kvdb: compaction filter on flush: %w", ferr)
+				}
+				if d == compact.Drop {
+					tik := key.EncodeInternalKey(uk, key.SeqNum(ik), key.TypeDeletion)
+					if first == nil {
+						first = append([]byte(nil), tik...)
+					}
+					last = append(last[:0], tik...)
+					if err := w.Add(tik, nil); err != nil {
+						w.Abandon()
+						return nil, err
+					}
+					continue
+				}
+			}
+		}
 		if first == nil {
 			first = append([]byte(nil), ik...)
 		}

@@ -190,6 +190,29 @@ type Options struct {
 	// 点查长尾突然变高 —— 给它限一个配额，就是把长尾换成交付时间。
 	CompactionRateLimit int
 
+	// CompactionFilter 在后台 Compaction 时对每个 user key 的"最新可见版本"
+	// 调用一次，判为 Drop 的记录按墓碑语义处理（物理清除发生在这一步）。
+	// nil = 不过滤。
+	//
+	// 调用发生在后台线程：不保证顺序、同一条记录会随多次 Compaction 被多次
+	// 判定，实现必须并发安全。Filter 返回 error 会让本次 Compaction 失败并
+	// 停库 —— 过滤器的内部故障被当作引擎故障，而不是静默跳过。
+	//
+	// Name() 会被写进 Manifest 用于校验目录与配置是否匹配：目录一旦用某个
+	// 过滤器的名字落过盘，之后换名字（或不再配置过滤器）打开会报错，
+	// 级别同 Comparer.Name —— 换一套过滤语义读老目录，会造成
+	// "该丢的没丢、不该丢的丢了"。
+	CompactionFilter CompactionFilter
+
+	// FilterOnFlush 为真时 Flush 也执行过滤（默认 false，只在 Compaction 生效）。
+	//
+	// 默认不开的理由：Flush 在前台关键路径上（决定 MemTable 能否释放），
+	// 把用户回调插在那里等于把引擎的延迟暴露给用户代码。打开它适合
+	// "写完就想尽快清掉过期数据"的负载；注意两点：Filter 的 error 会让
+	// Flush 失败并停库；崩溃后 WAL 重放可能让被过滤的数据临时回来一次
+	// （过滤是幂等的，重放后再 Flush 会再次清掉）。
+	FilterOnFlush bool
+
 	// LogMaxSize 是数据目录下 LOG 文件的轮转阈值，单位字节。
 	//
 	// 0 = 用 DefaultLogMaxSize（1MB）；负数 = 不写文件日志（Logger 为 nil 时

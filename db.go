@@ -387,7 +387,12 @@ func Open(opts Options) (*DB, error) {
 		cmp:         opts.Comparer,
 		icmp:        opts.internalKeyComparer(),
 		lock:        lock,
-		vset:        version.New(version.Config{Dir: opts.Dir, Comparer: opts.Comparer, MaxLevels: opts.MaxLevels}),
+		vset: version.New(version.Config{
+			Dir:        opts.Dir,
+			Comparer:   opts.Comparer,
+			MaxLevels:  opts.MaxLevels,
+			FilterName: compactionFilterName(opts.CompactionFilter),
+		}),
 		readers:     make(map[uint64]*sst.Reader),
 		snapshots:   make(map[uint64]int),
 		blockStats:  &sst.BlockStats{},

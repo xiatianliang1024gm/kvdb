@@ -283,6 +283,10 @@ type Config struct {
 	Dir string
 	// Comparer 决定 key 顺序；它的 Name() 会写进 Manifest，用于校验目录与配置匹配。
 	Comparer key.Comparer
+	// FilterName 是 CompactionFilter 的稳定标识（未配置过滤器时为空）。
+	// 它会写进 Manifest 并在重放时校验，语义同 Comparer 的名字：目录一旦用某个
+	// 过滤器落过盘，之后就只能用同名过滤器打开。
+	FilterName string
 	// MaxLevels 是层数（含 L0）。
 	MaxLevels int
 }
@@ -308,6 +312,7 @@ type VersionSet struct {
 	manifest     *Manifest
 	manifestNum  uint64
 	comparerName string
+	filterName   string
 	closed       bool
 }
 
@@ -321,6 +326,7 @@ func New(cfg Config) *VersionSet {
 		cfg:          cfg,
 		icmp:         key.InternalComparer{User: cfg.Comparer},
 		comparerName: cfg.Comparer.Name(),
+		filterName:   cfg.FilterName,
 		nextFileNum:  1,
 	}
 	vs.current = vs.emptyVersion()

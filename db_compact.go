@@ -69,6 +69,7 @@ func (db *DB) runCompactions() error {
 			RateLimiter:      db.rateLimiter,
 			TargetFileSize:   db.opts.targetFileSize(c.OutputLevel),
 			SmallestSnapshot: snapshot,
+			Filter:           db.opts.CompactionFilter,
 			AllocFileNum:     db.vset.AllocFileNum,
 			Reader:           db.readerForMaintenance,
 			Commit:           db.commitCompaction,

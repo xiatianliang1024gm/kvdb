@@ -186,6 +186,7 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 
 	levels := make([][]*FileMeta, vs.cfg.MaxLevels)
 	recordedName := ""
+	recordedFilterName := ""
 	r := wal.NewReader(f)
 	for {
 		record, rerr := r.ReadRecord()
@@ -213,6 +214,13 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 				return truncated, fmt.Errorf("kvdb/version: manifest %s mixes comparers %q and %q", path, recordedName, e.ComparatorName)
 			}
 		}
+		if e.FilterName != "" {
+			if recordedFilterName == "" {
+				recordedFilterName = e.FilterName
+			} else if recordedFilterName != e.FilterName {
+				return truncated, fmt.Errorf("kvdb/version: manifest %s mixes compaction filters %q and %q", path, recordedFilterName, e.FilterName)
+			}
+		}
 		vs.applyCountersLocked(e)
 		for _, d := range e.Deleted {
 			if d.Level < 0 || d.Level >= len(levels) {
@@ -232,6 +240,15 @@ func (vs *VersionSet) replayManifestLocked(num uint64) (truncated bool, err erro
 		return truncated, fmt.Errorf(
 			"kvdb/version: data directory was written with comparer %q, but the option specifies %q",
 			recordedName, vs.comparerName)
+	}
+	// 过滤器名字的校验比比较器宽松半档：老目录（M6 之前）没记过这个名字，
+	// 允许"第一次给一个已有目录配置过滤器"；但一旦记过就冻结 —— 换名字、
+	// 甚至去掉过滤器再打开，都会被拒绝。理由与比较器同级：换一套过滤语义
+	// 读老目录，会造成"该丢的没丢、不该丢的丢了"。
+	if recordedFilterName != "" && recordedFilterName != vs.filterName {
+		return truncated, fmt.Errorf(
+			"kvdb/version: data directory was written with compaction filter %q, but the option specifies %q",
+			recordedFilterName, vs.filterName)
 	}
 
 	nv := &Version{vset: vs, levels: levels}
@@ -309,6 +326,7 @@ func (vs *VersionSet) NewManifest() error {
 func (vs *VersionSet) snapshotEditLocked() *VersionEdit {
 	edit := &VersionEdit{
 		ComparatorName: vs.comparerName,
+		FilterName:     vs.filterName,
 		NextFileNum:    vs.nextFileNum,
 		LastSeq:        vs.lastSeq,
 		LogNumber:      vs.logNumber,

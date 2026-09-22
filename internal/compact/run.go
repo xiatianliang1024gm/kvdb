@@ -64,6 +64,16 @@ type Env struct {
 	// 至于"比它更新的版本"为什么不丢：那些版本正是所有人现在会读到的东西。
 	SmallestSnapshot uint64
 
+	// Filter 非 nil 时，对每个 user key 的"最新可见版本"（seq <= SmallestSnapshot
+	// 的第一条记录，且类型为 TypeValue）调用一次。判为 Drop 的记录转成墓碑语义：
+	// 输出层以下还有这个 key 就写一条同序列号的 TypeDeletion，否则整条丢掉。
+	//
+	// 之所以卡在这个位置，是它与快照隔离唯一自洽的交点：seq 更大的记录可能是
+	// 某些读者的"现在"，引擎不替用户做丢弃决定；而 seq 更小的旧版本早就被
+	// covered 丢掉了，轮不到过滤器。代价是一个长期存活的老快照会让过滤器
+	// 大面积失效 —— 这与"快照钉住 GC"是同一件事的两个面。
+	Filter Filter
+
 	// AllocFileNum 分配一个新的文件编号。
 	AllocFileNum func() uint64
 	// Reader 返回一个已提交文件号的读取器。
@@ -218,7 +228,30 @@ func Run(c *Compaction, v *version.Version, env Env) (Result, error) {
 		}
 		if key.SeqNum(ik) <= env.SmallestSnapshot {
 			covered = true
-			if key.KindOf(ik) == key.TypeDeletion && base.isBaseLevel(uk) {
+			kind := key.KindOf(ik)
+			if env.Filter != nil && kind == key.TypeValue {
+				d, ferr := env.Filter.Filter(c.OutputLevel, uk, mi.Value(), key.SeqNum(ik))
+				if ferr != nil {
+					return res, fmt.Errorf("kvdb/compact: compaction filter %q: %w", env.Filter.Name(), ferr)
+				}
+				if d == Drop {
+					// filter 说丢，语义上等价于这条数据被删除。但"跳过不写"不够：
+					// 更深层可能还躺着一个更旧的版本，丢掉本层的记录会让它复活。
+					// 处理沿用墓碑的退休判据（与下面的 TypeDeletion 分支完全同构）：
+					// 是 base level 就整条丢掉，否则写一条**同序列号**的墓碑继续遮蔽，
+					// 交给以后的 Compaction 退休。
+					if base.isBaseLevel(uk) {
+						res.DroppedRecords++
+						continue
+					}
+					res.InputRecords++
+					if err := out.add(key.EncodeInternalKey(uk, key.SeqNum(ik), key.TypeDeletion), nil); err != nil {
+						return res, err
+					}
+					continue
+				}
+			}
+			if kind == key.TypeDeletion && base.isBaseLevel(uk) {
 				// 墓碑的唯一使命是遮蔽更旧的版本。此刻：更旧的版本已经被 covered 丢掉，
 				// 输出层以下也没有这个 key 需要遮蔽 —— 墓碑本身可以消失了。
 				// 不满足这个条件时保守保留：把墓碑留下只会浪费一点空间，
