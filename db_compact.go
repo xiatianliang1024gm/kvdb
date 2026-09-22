@@ -47,6 +47,11 @@ func (db *DB) compactLoop() {
 // 每轮都重新从"当前版本"出发挑一次，而不是一次挑完排队执行：
 // 上一轮的结果会改变各层的规模，也改变了下一轮该挑谁。
 func (db *DB) runCompactions() error {
+	// 手动 CompactRange（M10）可能正在跑：两边都从"当前版本"选输入、
+	// 都经 commitCompaction 提交，并发跑会选到重叠的输入、提交互相踩脚。
+	// compactMu 把手动与后台串成单线程；拿锁之前不持 db.mu，无锁序问题。
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
 	for {
 		v, snapshot, err := db.compactionPlan()
 		if err != nil {
@@ -62,22 +67,7 @@ func (db *DB) runCompactions() error {
 		// 整轮 Compaction 期间都持有这个版本引用：输入文件因此不会被
 		// garbage collection 收走 —— 归并读到一半文件消失，是这类系统里
 		// 最难复现的一类崩溃。
-		res, err := compact.Run(c, v, compact.Env{
-			Dir:             db.opts.Dir,
-			ICmp:            db.icmp,
-			BlockSize:       db.opts.BlockSize,
-			BloomBitsPerKey: db.opts.BloomBitsPerKey,
-			Compression:     db.opts.Compression.toType(),
-			RateLimiter:     db.rateLimiter,
-			TargetFileSize:  db.opts.targetFileSize(c.OutputLevel),
-			SmallestSnapshot: snapshot,
-			Filter:          db.opts.CompactionFilter,
-			Merge:           db.opts.MergeOperator,
-			RangeDeletions:  v.RangeDeletions(),
-			AllocFileNum:    db.vset.AllocFileNum,
-			Reader:          db.readerForMaintenance,
-			Commit:          db.commitCompaction,
-		})
+		res, err := compact.Run(c, v, db.compactionEnv(v, c, snapshot))
 		v.Unref()
 		if err != nil {
 			if errors.Is(err, errClosing) {
@@ -92,6 +82,151 @@ func (db *DB) runCompactions() error {
 			c, res.InputFiles, humanBytes(res.InputBytes), res.OutputFiles, humanBytes(res.OutputBytes), res.DroppedRecords)
 		db.collectGarbage()
 	}
+}
+
+// compactionEnv 构造一次 Compaction 的执行环境。后台自动 Compaction 与
+// 手动 CompactRange 用的是同一份 —— 归并语义不该因为"谁触发的"而不同。
+//
+// v 必须传调用方持有引用的那个版本而不是 db.v：范围墓碑表随版本走，
+// 并发提交随时可能把 db.v 换掉，锁外读 db.v 是数据竞争。
+func (db *DB) compactionEnv(v *version.Version, c *compact.Compaction, snapshot uint64) compact.Env {
+	return compact.Env{
+		Dir:              db.opts.Dir,
+		ICmp:             db.icmp,
+		BlockSize:        db.opts.BlockSize,
+		BloomBitsPerKey:  db.opts.BloomBitsPerKey,
+		Compression:      db.opts.Compression.toType(),
+		RateLimiter:      db.rateLimiter,
+		TargetFileSize:   db.opts.targetFileSize(c.OutputLevel),
+		SmallestSnapshot: snapshot,
+		Filter:           db.opts.CompactionFilter,
+		Merge:            db.opts.MergeOperator,
+		RangeDeletions:   v.RangeDeletions(),
+		AllocFileNum:     db.vset.AllocFileNum,
+		Reader:           db.readerForMaintenance,
+		Commit:           db.commitCompaction,
+	}
+}
+
+// CompactRange 把 [start, end) 区间内的数据一路向下压实（M10，EXTENSIONS.md §5.4）。
+//
+// start / end 为 nil 表示该侧不设界；end <= start 是空区间，直接返回 nil。
+//
+// 做三件事：
+//
+//  1. 先 Flush —— MemTable 里的数据不落盘就不参与 Compaction，
+//     "刚写完就清表"的场景会漏掉整整一张表；
+//  2. 从 L0 起逐层把与区间重叠的文件压到下一层，循环到区间内的数据
+//     全部落在最底层（或区间里已经没有文件）；
+//  3. 每次提交后 retireRangeTombstonesLocked 照常判定墓碑退休。
+//
+// 为什么需要它：自动 Compaction 是分数驱动的（L0 文件数 / 层容量），清表
+// 之后剩下的范围墓碑和零星文件可能永远凑不够触发条件 —— 空间就永远
+// 回收不了。CompactRange 是"不等分数、现在就搬"的手动通道，范围删除
+// 之后的空间回收（EXTENSIONS.md §4.1 的"回收时机由 Compaction 决定"）
+// 就落在它这一路。
+//
+// 代价必须写明：区间数据每经过一层就被完整重写一次，写放大 ≈ 层数。
+// 这是"手动、低频"的操作定位 —— 别当日常维护用。
+//
+// 并发：与后台 Compaction 互斥（compactMu），与读写完全并发 —— 版本引用
+// 保证输入文件在归并期间不被回收，语义与后台 Compaction 一致。
+func (db *DB) CompactRange(start, end []byte) error {
+	if start != nil && end != nil && db.cmp.Compare(start, end) >= 0 {
+		return nil
+	}
+	// 先 Flush 再拿 compactMu：Flush 会等 flushLoop（它不碰 compactMu），
+	// 顺序反了就是"拿着 compactMu 等一个不需要 compactMu 的后台任务"，白等。
+	if err := db.Flush(); err != nil {
+		return err
+	}
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
+	for {
+		v, snapshot, err := db.compactionPlan()
+		if err != nil {
+			if errors.Is(err, errClosing) {
+				return ErrClosed
+			}
+			return err
+		}
+		c := pickRangeCompaction(v, db.cmp, start, end)
+		if c == nil {
+			// 区间内的数据已经全部在最底层（或区间里没有数据）：
+			// 再往下没有层可去，区间维度的压实收敛。
+			v.Unref()
+			return nil
+		}
+		db.logInfof("manual compaction start: %s", c)
+		res, err := compact.Run(c, v, db.compactionEnv(v, c, snapshot))
+		v.Unref()
+		if err != nil {
+			if errors.Is(err, errClosing) {
+				return ErrClosed
+			}
+			db.logErrorf("manual compaction failed: %s: %v", c, err)
+			return fmt.Errorf("kvdb: compact range: %w", err)
+		}
+		db.recordCompaction(res)
+		db.logInfof("manual compaction done: %s inputs=%d(%s) outputs=%d(%s) dropped=%d",
+			c, res.InputFiles, humanBytes(res.InputBytes), res.OutputFiles, humanBytes(res.OutputBytes), res.DroppedRecords)
+		db.collectGarbage()
+	}
+}
+
+// pickRangeCompaction 从 L0 向下找第一层"有与 [start, end) 重叠的文件、且
+// 下面还有一层可去"的层，照 compact.Pick 的构造规则配好输入集合；找不到
+// 返回 nil。start / end 为 nil 表示该侧不设界。
+//
+// 与 Pick 的分工是刻意的：Pick 回答"分数要求我现在搬谁"，这里回答
+// "这个区间还有谁没到底"。前者的输入集合选择（最老文件、最左文件）是
+// 为分摊服务的设计，手动压实要的是"区间内一个不留"，直接取全部重叠文件。
+func pickRangeCompaction(v *version.Version, cmp key.Comparer, start, end []byte) *compact.Compaction {
+	for level := 0; level < v.NumLevels()-1; level++ {
+		var inputs []*version.FileMeta
+		for _, f := range v.Files(level) {
+			if overlapsRange(cmp, key.UserKey(f.Smallest), key.UserKey(f.Largest), start, end) {
+				inputs = append(inputs, f)
+			}
+		}
+		if len(inputs) == 0 {
+			continue
+		}
+		// 输入的区间用 internal key 求（与 pickL0 的 span 同构）：
+		// Overlapping 的另一半必须一起归并，否则"同层不重叠"当场破掉。
+		icmp := v.Comparer()
+		var smallest, largest []byte
+		for _, f := range inputs {
+			if smallest == nil || icmp.Compare(f.Smallest, smallest) < 0 {
+				smallest = f.Smallest
+			}
+			if largest == nil || icmp.Compare(f.Largest, largest) > 0 {
+				largest = f.Largest
+			}
+		}
+		return &compact.Compaction{
+			Level:       level,
+			OutputLevel: level + 1,
+			Inputs: [2][]*version.FileMeta{
+				inputs,
+				v.Overlapping(level+1, smallest, largest),
+			},
+		}
+	}
+	return nil
+}
+
+// overlapsRange 判定文件区间 [fileSmallest, fileLargest] 与查询区间
+// [start, end) 是否相交（user key 维度，半开；start/end 为 nil 表示不设界）。
+// 判据与 rangeHasRecordsLocked 一致：fileSmallest < end 且 fileLargest >= start。
+func overlapsRange(cmp key.Comparer, fileSmallest, fileLargest, start, end []byte) bool {
+	if start != nil && cmp.Compare(fileLargest, start) < 0 {
+		return false
+	}
+	if end != nil && cmp.Compare(fileSmallest, end) >= 0 {
+		return false
+	}
+	return true
 }
 
 // compactionPlan 取出"用哪个版本挑 Compaction、可以丢到哪个序列号为止"。

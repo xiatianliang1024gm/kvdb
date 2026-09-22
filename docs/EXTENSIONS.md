@@ -5,7 +5,8 @@
 > 本文只写"还缺什么、怎么补"；**kvdb 现有的功能以 `docs/DESIGN.md` 为准**，两份文档不重叠。
 >
 > 状态：M6（§4.2 CompactionFilter）、M7（§4.1 DeleteRange + §5.1 半开上界/Prefix）、
-> M8（§4.3 Merge 算子）与 M9（§4.4 提交期校验原语）已实施 ｜ 最后更新：2026-09-22
+> M8（§4.3 Merge 算子）、M9（§4.4 提交期校验原语）与 M10（§5.2 MultiGet +
+> §5.4 Flush/Sync/CompactRange + §5.5 GetInto）已实施 ｜ 最后更新：2026-09-22
 
 ## 目录
 
@@ -309,6 +310,10 @@ func (db *DB) MultiGet(keys [][]byte) ([][]byte, []error)
 现在每次 `Get` 都要一次 `db.mu.RLock()` + 逐层二进制定位一次。`MGET` / `WHERE id IN (...)` / JOIN 探测可以把这些摊销掉。**关键收益在排序**：内部按 user key 排序后，相邻 key 会命中同一个 SST 的同一个块，把 N 次随机块读变成顺序块读。
 
 落点：`db.go` 新方法，内部复用 `getLocked`；不需要动 `internal/`。
+- **实施注记（M10）**：整批共用一次 `db.mu.RLock`（摊销的是锁，排序摊销的是块读）；
+  查找前按 Comparer 对**下标副本**排序，调用方的 `keys` 不被改动；排序内相同的
+  key 只查一次，但各下标拿独立副本。去重只做单次调用内，`Stats().Gets` 按实际
+  下探次数计数。空 key / `ErrNotFound` / 关库都是逐位置的 error，不拖垮整批。
 
 ### 5.3 反向迭代
 
@@ -329,6 +334,20 @@ func (db *DB) CompactRange(start, end []byte) error
 - `Flush`：`Close` 刻意不落 MemTable（DESIGN §9，设计如此），所以长跑服务重启要重放整条 WAL。想要"优雅关闭快速重启"就需要它。实现：拿 `db.mu.Lock()` → `freezeLocked()` → 在 `db.cond` 上等 `db.imm == nil`。**复用 `db.cond`，不引入新机制。**
 - `Sync`：`SyncWrites` 是全局开关，且没有"想 fsync 时能 fsync、并知道耐久到了哪个序列号"。`appendfsync everysec` 这类策略必须要有它。
 - `CompactRange`：清表之后的空间回收只能等后台自动挑中，需要能手动催。注意 `Checkpoint` 已经覆盖"备份不丢未落盘数据"，它解决不了这个问题。
+- **实施注记（M10）**：
+  - `Flush`：`freezeLocked` 冻结 + 在 `db.cond` 上等 `db.imm == nil`，与写者共用
+    同一个等待条件；MemTable 判空必须持 `db.mu` 做（写者只在写临界区里改它）。
+  - `Sync`：**持 `db.mu.RLock` 做 fsync** —— 读锁挡住 `freezeLocked` 换日志、
+    也冻结 `lastSeq`（只在写临界区推进），"返回值已耐久"因此不需要额外同步。
+    实际耐久的可能比返回值更多（已追加未落库的记录被顺带刷下），但不进入承诺。
+  - `CompactRange`：先 `Flush`，然后从 L0 起逐层把与 [start, end) 重叠的文件
+    压到下一层，循环到区间数据全部落进最底层（根包内自建 `compact.Compaction`
+    复用 `compact.Run`，没有改 `Pick`）。代价：写放大 ≈ 层数，手动低频使用。
+  - 新增 `compactMu` 把手动与后台 Compaction 串成单线程：两边都从"当前版本"
+    选输入、都走 `commitCompaction`，并发跑会互踩。锁序 `compactMu` 在 `db.mu` 外。
+  - 与 M7 保守退休判据的相互作用要记住：无界 `CompactRange` 会把删除段两侧的
+    数据归并进同一个输出文件，文件区间横跨被删段时墓碑**不退休**（合法，
+    只是回收不完全）。要墓碑退休，压的区间就别把删除段和存活数据合进一个文件。
 
 ### 5.5 GetInto（零拷贝读）
 
@@ -339,6 +358,9 @@ func (db *DB) GetInto(dst []byte, userKey []byte) ([]byte, error)
 ```
 
 `dst` 容量够就 copy 进去，不够则退化为现在的分配行为。**先不做"返回持有块缓存引用的句柄 + Release"**——那会引入一整套生命周期约定，收益不足以抵消复杂度。
+- **实施注记（M10）**：没有截断语义——容量不够时返回**完整值**的新切片；
+  出错时返回 `(nil, err)` 且不触碰 `dst`。容量够时返回值就是 `dst` 的前缀切片
+  （空 value 时长度为 0）。
 
 ### 5.6 读路径去全局锁
 

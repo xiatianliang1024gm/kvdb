@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -131,6 +132,16 @@ type DB struct {
 	compactCh chan struct{}
 	closeCh   chan struct{}
 	bgWG      sync.WaitGroup
+
+	// compactMu 串行化所有 Compaction 的"挑选 + 执行"（M10）：后台 compactLoop
+	// 与手动 CompactRange 都从这把锁过。理由是两边做的事情完全同构 —— 都从
+	// "当前版本"选输入、都走 compact.Run、都经 commitCompaction 提交 —— 并发跑
+	// 会选到重叠的输入集合、并发提交互相踩脚。手动 Compaction 期间后台那一轮
+	// 会等在锁上，符合"手动操作优先"的直觉。
+	//
+	// 锁序：compactMu 在 db.mu 之外（拿 compactMu 之前不持 db.mu），
+	// 锁内需要版本或快照时通过 compactionPlan 短暂进出 db.mu。
+	compactMu sync.Mutex
 }
 
 // counters 汇总累计指标。
@@ -632,6 +643,103 @@ func (db *DB) Get(userKey []byte) ([]byte, error) {
 	return copyValue(v), nil
 }
 
+// MultiGet 一次读取多个 key，结果与输入按下标对齐（M10，EXTENSIONS.md §5.2）。
+//
+// key 不存在时对应位置返回 (nil, ErrNotFound)，与 Get 一致；空 key 报
+// ErrEmptyKey、库已关闭报 ErrClosed，都是逐位置的 error，不拖垮整批。
+//
+// 内部把 key 按 Comparer 排序后逐个走 getLocked（不是并发，是排序）：
+// 相邻的 key 会命中同一个 SST 的同一个数据块，把 N 次随机块读变成顺序块读，
+// 这是这个方法相对"循环调 Get"的全部收益所在。调用方的 keys 不会被改动；
+// 排序只作用于一份下标副本。重复 key 只查一次，各下标拿到独立副本，
+// 改其中一份不会影响另一份。
+//
+// 整批共用一次 db.mu.RLock：这是要摊销的另一半成本（Get 每次都要拿一次）。
+// 代价是超大批次会拉长写者等写锁的时间 —— 批次请按业务的自然边界切，
+// 别把十万 key 塞进一次 MultiGet。
+func (db *DB) MultiGet(keys [][]byte) ([][]byte, []error) {
+	values := make([][]byte, len(keys))
+	errs := make([]error, len(keys))
+	if len(keys) == 0 {
+		return values, errs
+	}
+
+	// 下标排序：按 user key 的字典序（引擎的 Comparer）安排查找顺序。
+	order := make([]int, len(keys))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		return db.cmp.Compare(keys[order[a]], keys[order[b]]) < 0
+	})
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		for i := range errs {
+			errs[i] = ErrClosed
+		}
+		return values, errs
+	}
+
+	prev := -1
+	for _, idx := range order {
+		if prev >= 0 && db.cmp.Compare(keys[idx], keys[prev]) == 0 {
+			// 与上一个下标是同一个 key：复用结果，但复制一份值，
+			// 保证"改一个下标的返回值"不会波及其它下标。
+			if values[prev] != nil {
+				values[idx] = append([]byte(nil), values[prev]...)
+			}
+			errs[idx] = errs[prev]
+			continue
+		}
+		prev = idx
+		if len(keys[idx]) == 0 {
+			errs[idx] = ErrEmptyKey
+			continue
+		}
+		db.counters.gets.Add(1)
+		v, err := db.getLocked(db.lastSeq, keys[idx])
+		if err != nil {
+			errs[idx] = err // ErrNotFound 或真实的读失败，都只算这个 key 的
+			continue
+		}
+		values[idx] = copyValue(v)
+	}
+	return values, errs
+}
+
+// GetInto 是 Get 的零分配变体（M10，EXTENSIONS.md §5.5）：值写进调用方的
+// dst 里返回，容量够就一个字节都不分配，不够则退化为 Get 的分配行为
+// （返回完整值的新切片，不做截断）。
+//
+// 返回值要么是 dst 的一个前缀切片，要么是一块新分配的完整值；两种情况都
+// 可以安全持有与修改。出错时返回 (nil, err)，dst 的内容不会被触碰。
+//
+// 典型用法是把复用的缓冲区传来传去："读出来直接往 socket 写"的服务从此
+// 在读路径上零分配。不做"返回持有块缓存引用的句柄"那种更激进的零拷贝 ——
+// 那要引入一整套生命周期约定，收益抵不上复杂度（EXTENSIONS.md 附录 C）。
+func (db *DB) GetInto(dst []byte, userKey []byte) ([]byte, error) {
+	if len(userKey) == 0 {
+		return nil, ErrEmptyKey
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrClosed
+	}
+	db.counters.gets.Add(1)
+	v, err := db.getLocked(db.lastSeq, userKey)
+	if err != nil {
+		return nil, err
+	}
+	if cap(dst) >= len(v) {
+		return append(dst[:0], v...), nil
+	}
+	return copyValue(v), nil
+}
+
 // GetForUpdate 与 Get 语义相同，额外返回可见版本的序列号（M9）。
 //
 // seq 是提交期校验的关键：上层事务读时记下 (key, seq)，提交时在 WriteChecked
@@ -966,6 +1074,61 @@ func (db *DB) freezeLocked() error {
 		_ = old.Close()
 	}
 	db.notifyFlush()
+	return nil
+}
+
+// Flush 冻结当前 MemTable 并等它落盘（M10，EXTENSIONS.md §5.4）。
+//
+// Close 刻意不刷 MemTable（DESIGN §9，数据在 WAL 里，Open 时重放），
+// 于是"长跑服务优雅关闭 → 重启快速可用"缺一块：不 Flush 的话，每次重启
+// 都要重放整条 WAL。Flush 就是补这块的手动开关：返回 nil 时，调用那一刻
+// MemTable 里的全部数据都已经变成 SST 并提交进版本，WAL 里的对应记录
+// 随之可删。
+//
+// 实现完全复用既有机制，不引入新东西（EXTENSIONS.md 附录 C 的决策）：
+// freezeLocked 冻结（它自己会等上一张 Immutable 落盘），然后在与写者相同的
+// db.cond 上等 db.imm == nil —— flushLoop 落完盘会 Broadcast，这里就醒了。
+//
+// 并发语义：返回之后新写入照常进新的 MemTable（不受影响）；Flush 期间
+// 一直有写者涌入时，这里等的只是"调用那一刻那张表"，不会无限等待后来的
+// 数据 —— 每张 Immutable 落完就放行。MemTable 为空时是零成本空操作。
+func (db *DB) Flush() error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return ErrClosed
+	}
+	if db.bgErr != nil {
+		err := db.bgErr
+		db.mu.Unlock()
+		return err
+	}
+	// 检查必须持锁做：MemTable 只在 db.mu 写临界区里变化，锁外判空
+	// 会跟"刚要落库的写者"竞争 —— 判空判早了，数据就漏在 WAL 里没刷。
+	if db.mem.Empty() {
+		db.mu.Unlock()
+		return nil
+	}
+	if err := db.freezeLocked(); err != nil {
+		db.mu.Unlock()
+		return err
+	}
+	// freezeLocked 返回时旧表已挂上 imm 并通知了后台。剩下的等待条件
+	// 与 freezeLocked / 写者用的完全一致：imm 清空 = 落盘成功。
+	for db.imm != nil && db.bgErr == nil && !db.closed {
+		db.cond.Wait()
+	}
+	switch {
+	case db.bgErr != nil:
+		// 落盘失败：Immutable 还挂着，库已停，错误与写者拿到的是同一个。
+		db.mu.Unlock()
+		return db.bgErr
+	case db.imm != nil:
+		// 等待期间库被 Close：flushLoop 已退出，这张表不会再落盘了。
+		db.mu.Unlock()
+		return ErrClosed
+	}
+	db.mu.Unlock()
 	return nil
 }
 

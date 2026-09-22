@@ -357,6 +357,43 @@ func (db *DB) appendWriteGroup(log *wal.Log, group []*writeRequest) error {
 	return nil
 }
 
+// Sync 把 WAL 刷到磁盘（fsync），返回已耐久的序列号（M10，EXTENSIONS.md §5.4）。
+//
+// SyncWrites 是全局开关，开了每笔写都付 fsync，关了则完全没有"现在想耐久
+// 一下"的手段 —— appendfsync everysec 这类策略两头都不讨好。Sync 补的就是
+// 这个口子：平时 SyncWrites 关着享受组提交的摊销，关键时刻调一次 Sync。
+//
+// 返回值语义要读准：它是**调用那一刻已可见的最后序列号**（db.lastSeq），
+// 承诺是"Sync 正常返回后，序列号 <= 返回值的所有写入都已 fsync 耐久"。
+// 实际耐久的可能更多 —— 队长可能刚好把已追加、尚未落库（lastSeq 未推进）
+// 的记录一起刷下去了 —— 但那些记录此刻还不可见，不进入承诺范围。
+//
+// 实现刻意**持着 db.mu 读锁做 fsync**，两条不变式因此免费成立：
+//
+//  1. flush 的 freezeLocked 换不掉 db.log（换日志要先拿写锁），
+//     fsync 的对象从头到尾是同一个文件；
+//  2. lastSeq 只在 db.mu 写临界区里推进，持读锁期间纹丝不动，
+//     "返回值已耐久"不需要任何额外同步。
+//
+// 代价：fsync 期间读者照常（读锁共享），但队长的落库步和 Flush 的提交步
+// 要等写锁，会排一会儿队 —— 与 SyncWrites 为真时的每笔写同理，
+// 这是拿耐久性必须付的钱，而且只在显式调用时付。
+func (db *DB) Sync() (uint64, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return 0, ErrClosed
+	}
+	if db.log == nil {
+		return db.lastSeq, nil
+	}
+	if err := db.log.Sync(); err != nil {
+		return 0, fmt.Errorf("kvdb: sync the wal: %w", err)
+	}
+	db.counters.walSyncs.Add(1)
+	return db.lastSeq, nil
+}
+
 // applyWriteGroup 把已经落盘的整组写入落进 MemTable，并推进序列号水位。
 //
 // 整组在**同一个 db.mu 临界区**里应用，这是"批次原子性"在并发下的表现形式：
